@@ -14,19 +14,27 @@ def build_prompt(qa_id: str, question: str, answer: str, context: str = "") -> s
         Formatted prompt string for the model
     """
     
-    prompt = f"""You are an expert rater for the Google QUEST Q&A Labeling task. Your job is to evaluate a Question-Answer pair and assign continuous scores between 0.0 and 1.0 for 30 specific attributes.
+    prompt = f"""You are an expert rater for the Google QUEST Q&A Labeling task. Your job is to evaluate a Question-Answer pair and assign PRECISE CONTINUOUS scores between 0.0 and 1.0 for 30 specific attributes.
 
-### Scoring Guide
-- **0.0**: The attribute is completely absent or false.
-- **0.5**: The attribute is partially present or average.
-- **1.0**: The attribute is fully present, dominant, or true.
+### CRITICAL: Use Fine-Grained Continuous Scores
+- DO NOT limit yourself to just 0.0, 0.5, or 1.0
+- Use decimal precision (e.g., 0.23, 0.67, 0.84, 0.15)
+- Think of scores as percentages: 0.23 = 23%, 0.67 = 67%
+- Each attribute should have a nuanced score reflecting subtle differences
+
+### Scoring Examples
+- **0.0-0.2**: Very weak/absent (e.g., 0.05, 0.12, 0.18)
+- **0.2-0.4**: Somewhat present (e.g., 0.23, 0.31, 0.39)
+- **0.4-0.6**: Moderate (e.g., 0.42, 0.55, 0.58)
+- **0.6-0.8**: Strong (e.g., 0.63, 0.72, 0.79)
+- **0.8-1.0**: Very strong/dominant (e.g., 0.81, 0.91, 0.97)
 
 ### Task
-Analyze the following Q&A pair and output a JSON object with scores for these 30 labels.
+Carefully analyze the following Q&A pair and output a JSON object with FINE-GRAINED scores for these 30 labels.
 
 **Question Attributes:**
-1. Intent: `question_asker_intent_understanding` (Is the intent clear?), `question_fact_seeking`, `question_opinion_seeking`, `question_multi_intent`.
-2. Quality: `question_well_written`, `question_body_critical` (Is the body crucial to understanding?), `question_conversational`, `question_expect_short_answer`.
+1. Intent: `question_asker_intent_understanding` (clarity of intent), `question_fact_seeking`, `question_opinion_seeking`, `question_multi_intent`.
+2. Quality: `question_well_written`, `question_body_critical` (body's importance), `question_conversational`, `question_expect_short_answer`.
 3. Type: `question_type_choice`, `question_type_compare`, `question_type_consequence`, `question_type_definition`, `question_type_entity`, `question_type_instructions`, `question_type_procedure`, `question_type_reason_explanation`, `question_type_spelling`.
 4. Impact: `question_has_commonly_accepted_answer`, `question_interestingness_others`, `question_interestingness_self`, `question_not_really_a_question`.
 
@@ -40,11 +48,11 @@ Analyze the following Q&A pair and output a JSON object with scores for these 30
 **Answer:** {answer}
 
 ### Output Format
-Return ONLY valid JSON. Do not include markdown formatting like ```json.
+Return ONLY valid JSON with decimal scores (2-3 decimal places). Do not include markdown formatting.
 {{
   "qa_id": "{qa_id}",
   "scores": {{
-    "question_asker_intent_understanding": <float>,
+    "question_asker_intent_understanding": <float with 2-3 decimals, e.g., 0.73>,
     "question_body_critical": <float>,
     "question_conversational": <float>,
     "question_expect_short_answer": <float>,
@@ -75,7 +83,7 @@ Return ONLY valid JSON. Do not include markdown formatting like ```json.
     "answer_type_reason_explanation": <float>,
     "answer_well_written": <float>
   }},
-  "justification": "One sentence summary of reasoning."
+  "justification": "Brief analysis of key scoring decisions."
 }}
 """
     return prompt
