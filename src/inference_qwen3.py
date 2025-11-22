@@ -105,41 +105,6 @@ def process_csv(input_csv: str, output_csv: str = None):
     print(f"\nSubmission saved to: {output_path}")
 
 
-def interactive_mode():
-    """Run in interactive mode for single Q&A inference."""
-    model_name = 'qwen3:8b'
-    
-    print(f"Starting Google QUEST Q&A Labeling with {model_name}")
-    print("Enter 'quit' or 'exit' to stop.\n")
-    
-    while True:
-        try:
-            print("\n" + "="*60)
-            question = input("Question: ").strip()
-            if question.lower() in ['quit', 'exit']:
-                print("Goodbye!")
-                break
-            
-            answer = input("Answer: ").strip()
-            if not answer:
-                continue
-            
-            qa_id = input("QA ID (optional): ").strip() or "0"
-            context = input("Context/Host (optional): ").strip()
-            
-            print("\nProcessing...")
-            result = inference_single(qa_id, question, answer, context)
-            
-            print("\nResult:")
-            print(json.dumps(result, indent=2))
-        
-        except KeyboardInterrupt:
-            print("\nExiting...")
-            break
-        except Exception as e:
-            print(f"Error: {e}", file=sys.stderr)
-
-
 if __name__ == "__main__":
     import argparse
 
