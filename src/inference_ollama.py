@@ -18,9 +18,14 @@ from labels import QUEST_LABELS
 from prompts import build_prompt
 
 
-def inference_single(qa_id: str, question: str, answer: str, context: str = "") -> Dict[str, Any]:
+def inference_single(
+    qa_id: str,
+    question: str,
+    answer: str,
+    context: str = "",
+    model_name: str = "qwen3:8b"
+) -> Dict[str, Any]:
     """Run inference on a single Q&A pair without thinking."""
-    model_name = 'qwen3:8b'
     prompt = build_prompt(qa_id, question, answer, context)
     
     # Call the chat API without thinking for faster inference
@@ -68,12 +73,13 @@ def inference_batch(data: List[Dict[str, str]]) -> List[Dict[str, Any]]:
     return results
 
 
-def process_csv(input_csv: str, output_csv: str = None):
+def process_csv(input_csv: str, output_csv: str = None, model_name: str = "qwen3:8b"):
     """Process test.csv and generate submission CSV."""
     input_path = Path(input_csv)
     output_path = Path(output_csv) if output_csv else Path("data/submission.csv")
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    print(f"Model: {model_name}")
     print(f"Reading from: {input_path}")
     print(f"Writing to: {output_path}\n")
 
@@ -88,7 +94,7 @@ def process_csv(input_csv: str, output_csv: str = None):
         context = item.get('host', '').strip()
 
         try:
-            result = inference_single(qa_id, question, answer, context)
+            result = inference_single(qa_id, question, answer, context, model_name)
             scores = result.get('scores', {label: 0.5 for label in QUEST_LABELS})
         except Exception as e:
             print(f"\nError on qa_id {qa_id}: {e}", file=sys.stderr)
@@ -108,9 +114,10 @@ def process_csv(input_csv: str, output_csv: str = None):
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description='Google QUEST Q&A Labeling with Qwen3 8B')
+    parser = argparse.ArgumentParser(description='Google QUEST Q&A Labeling with Ollama')
     parser.add_argument('--csv', type=str, default='data/test.csv', help='Input CSV (default: data/test.csv)')
     parser.add_argument('--output', type=str, default='data/submission.csv', help='Output CSV (default: data/submission.csv)')
+    parser.add_argument('--model', type=str, default='qwen3:8b', help='Ollama model name (default: qwen3:8b)')
 
     args = parser.parse_args()
-    process_csv(args.csv, args.output)
+    process_csv(args.csv, args.output, args.model)
