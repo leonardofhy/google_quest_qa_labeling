@@ -7,7 +7,7 @@ import csv
 from pathlib import Path
 from typing import List
 
-from inference_qwen3 import QUEST_LABELS
+from src.inference_qwen3_ollama import QUEST_LABELS
 
 BASE_COLUMNS = [
     "qa_id",
