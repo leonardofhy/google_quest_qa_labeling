@@ -62,17 +62,29 @@ def inference_single(
     """
     prompt = build_prompt(qa_id, question, answer, context)
     
+    # Format with chat template for Qwen models
+    chat_messages = [{"role": "user", "content": prompt}]
+    formatted_prompt = llm.get_tokenizer().apply_chat_template(
+        chat_messages,
+        tokenize=False,
+        add_generation_prompt=True
+    )
+    
     try:
         # Generate output
-        outputs = llm.generate([prompt], sampling_params)
+        outputs = llm.generate([formatted_prompt], sampling_params)
         response_text = outputs[0].outputs[0].text
+        
+        # Debug: print first response for inspection
+        if qa_id == "39":  # Only print first one
+            print(f"\nDEBUG - First response:\n{response_text[:500]}\n")
         
         # Extract JSON from response
         start_idx = response_text.find('{')
         end_idx = response_text.rfind('}') + 1
         
         if start_idx == -1 or end_idx == 0:
-            raise ValueError("No JSON found in response")
+            raise ValueError(f"No JSON found in response: {response_text[:200]}")
         
         json_str = response_text[start_idx:end_idx]
         result = json.loads(json_str)
@@ -102,9 +114,11 @@ def inference_batch(
     Returns:
         List of dictionaries with qa_id and scores
     """
-    # Build all prompts
+    # Build all prompts with chat template
     prompts = []
     qa_ids = []
+    tokenizer = llm.get_tokenizer()
+    
     for item in items:
         qa_id = item.get('qa_id', '')
         question = (item.get('question_title', '') + ' ' + item.get('question_body', '')).strip()
@@ -112,7 +126,16 @@ def inference_batch(
         context = item.get('host', '').strip()
         
         prompt = build_prompt(qa_id, question, answer, context)
-        prompts.append(prompt)
+        
+        # Format with chat template
+        chat_messages = [{"role": "user", "content": prompt}]
+        formatted_prompt = tokenizer.apply_chat_template(
+            chat_messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+        
+        prompts.append(formatted_prompt)
         qa_ids.append(qa_id)
     
     # Batch generation
@@ -146,7 +169,7 @@ def inference_batch(
 
 def process_csv(
     input_csv: str,
-    output_csv: str = None,
+    output_csv: str | None = None,
     model_name: str = "Qwen/Qwen3-8B",
     temperature: float = 0.3,
     top_p: float = 0.95,
