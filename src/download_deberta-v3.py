@@ -2,8 +2,8 @@ from transformers import AutoTokenizer, AutoModel, AutoConfig
 import os
 
 # 設定模型名稱與儲存路徑
-model_name = "microsoft/deberta-v3-base"
-save_path = "./deberta-v3-base"  # 這會在當前目錄建立一個資料夾
+model_name = "microsoft/deberta-v3-large"
+save_path = "./deberta-v3-large"  # 這會在當前目錄建立一個資料夾
 
 # 建立目錄
 os.makedirs(save_path, exist_ok=True)
