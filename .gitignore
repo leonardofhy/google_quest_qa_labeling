@@ -4,3 +4,9 @@
 *__pycache__
 
 data/submission_*.csv
+
+deberta-v3-base/
+
+quest-finetuned-weights/
+
+models/
