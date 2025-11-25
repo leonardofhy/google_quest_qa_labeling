@@ -27,7 +27,9 @@ Usage:
 
 import os
 import gc
+import json
 import argparse
+from datetime import datetime
 from collections import Counter
 from typing import List, Text, Optional, Callable, Tuple
 import numpy as np
@@ -53,12 +55,12 @@ torch.autograd.set_detect_anomaly(False)
 # ==========================================
 class Config:
     """Training and model configuration"""
-    model_name = "answerdotai/ModernBERT-base"
+    model_name = "answerdotai/ModernBERT-large"
     
-    # ModernBERT supports up to 8192 tokens
-    max_len = 1024
-    batch_size = 16         
-    accum_iter = 1          
+    # ModernBERT supports up to 8192 tokens - use longer context for better understanding
+    max_len = 2048  # Increased from 1024 to leverage ModernBERT's long context capability
+    batch_size = 8  # Reduced batch size to accommodate longer sequences (adjust based on GPU memory)
+    accum_iter = 2  # Increased accumulation to maintain effective batch size
     
     # Learning rates - ModernBERT may need slightly different tuning
     lr = 2e-5               # Encoder learning rate
@@ -70,10 +72,17 @@ class Config:
     validation_split = 0.2  # Only used when n_folds=1 (fast iteration mode)
     seed = 42
     num_workers = 8         # For data loading
+    
+    # Loss configuration (Combined Ranking Loss)
+    ranking_loss_weight = 0.6    # Weight for pairwise ranking loss
+    spearman_loss_weight = 0.4   # Weight for soft spearman loss
+    ranking_margin = 0.1         # Margin for ranking loss
+    ranking_threshold = 0.05     # Only consider pairs with target difference > threshold
+    spearman_temperature = 1.0   # Temperature for soft ranking
     train_csv = "data/train.csv"
     test_csv = "data/test.csv"
     sample_submission_csv = "data/sample_submission.csv"
-    output_dir = "models/modernbert_base_1fold"
+    output_dir = "models/modernbert_large"  # Will be appended with timestamp in train_loop()
     
     # Grouping strategy: Use question_title to prevent data leakage
     # (Same question can have multiple answers; we group them together)
@@ -104,7 +113,259 @@ def seed_everything(seed=42):
 
 
 # ==========================================
-# 2. Dataset Class (Optimized for ModernBERT)
+# 2. Custom Loss Functions (Optimized for Spearman Correlation)
+# ==========================================
+class PairwiseRankingLoss(nn.Module):
+    """
+    Pairwise Ranking Loss for optimizing Spearman correlation.
+    
+    For each pair (i, j) where target[i] > target[j], we want pred[i] > pred[j].
+    Uses margin ranking loss to enforce correct relative ordering.
+    
+    This directly optimizes for ranking, which is what Spearman correlation measures.
+    """
+    
+    def __init__(self, margin=0.1, threshold=0.05):
+        """
+        Args:
+            margin: Minimum difference required between pred[i] and pred[j]
+            threshold: Only consider pairs where |target[i] - target[j]| > threshold
+        """
+        super().__init__()
+        self.margin = margin
+        self.threshold = threshold
+    
+    def forward(self, preds, targets):
+        """
+        Args:
+            preds: (batch_size, num_labels) - model predictions (logits or sigmoid outputs)
+            targets: (batch_size, num_labels) - ground truth labels
+            
+        Returns:
+            Scalar loss value
+        """
+        batch_size, num_labels = preds.shape
+        device = preds.device
+        
+        # Apply sigmoid to get probabilities if needed
+        preds = torch.sigmoid(preds)
+        
+        total_loss = torch.tensor(0.0, device=device)
+        num_valid_pairs = 0
+        
+        # Process each label independently
+        for label_idx in range(num_labels):
+            pred_col = preds[:, label_idx]
+            target_col = targets[:, label_idx]
+            
+            # Create all pairwise comparisons
+            pred_diff = pred_col.unsqueeze(0) - pred_col.unsqueeze(1)  # (batch, batch)
+            target_diff = target_col.unsqueeze(0) - target_col.unsqueeze(1)  # (batch, batch)
+            
+            # Only consider pairs where target difference is significant
+            valid_mask = torch.abs(target_diff) > self.threshold
+            
+            if valid_mask.sum() == 0:
+                continue
+            
+            # Sign of target difference: +1 if i should rank higher than j, -1 otherwise
+            target_sign = torch.sign(target_diff)
+            
+            # Margin ranking loss: max(0, -sign * (pred_i - pred_j) + margin)
+            # We want pred_i > pred_j when target_i > target_j
+            loss = torch.clamp(self.margin - target_sign * pred_diff, min=0.0)
+            
+            # Apply mask and average
+            loss = (loss * valid_mask.float()).sum()
+            total_loss += loss
+            num_valid_pairs += valid_mask.sum()
+        
+        if num_valid_pairs > 0:
+            return total_loss / num_valid_pairs
+        else:
+            return torch.tensor(0.0, device=device, requires_grad=True)
+
+
+class SoftSpearmanLoss(nn.Module):
+    """
+    Differentiable approximation of Spearman correlation loss.
+    
+    Uses soft ranking (sigmoid-based) to compute differentiable ranks,
+    then computes Pearson correlation between soft ranks.
+    
+    Loss = 1 - mean(correlation across labels)
+    """
+    
+    def __init__(self, temperature=1.0, eps=1e-8):
+        """
+        Args:
+            temperature: Controls sharpness of soft ranking (lower = sharper)
+            eps: Small value for numerical stability
+        """
+        super().__init__()
+        self.temperature = temperature
+        self.eps = eps
+    
+    def soft_rank(self, x):
+        """
+        Compute soft (differentiable) ranks using sigmoid approximation.
+        
+        For each element x[i], its soft rank is approximately:
+        rank[i] = sum_j sigmoid((x[i] - x[j]) / temperature)
+        
+        This gives a differentiable approximation to the rank of each element.
+        
+        Args:
+            x: (batch_size,) tensor
+            
+        Returns:
+            (batch_size,) tensor of soft ranks
+        """
+        batch_size = x.shape[0]
+        
+        # Compute pairwise differences: diff[i, j] = x[i] - x[j]
+        diff = x.unsqueeze(1) - x.unsqueeze(0)  # (batch_size, batch_size)
+        
+        # Apply sigmoid to get soft comparison
+        # sigmoid((x[i] - x[j]) / temp) ≈ 1 if x[i] > x[j], ≈ 0 if x[i] < x[j]
+        soft_compare = torch.sigmoid(diff / self.temperature)
+        
+        # Sum along columns to get soft rank
+        # Higher values get higher ranks
+        soft_ranks = soft_compare.sum(dim=1)  # (batch_size,)
+        
+        return soft_ranks
+    
+    def pearson_correlation(self, x, y):
+        """
+        Compute Pearson correlation between two tensors.
+        
+        Args:
+            x, y: (batch_size,) tensors
+            
+        Returns:
+            Scalar correlation value
+        """
+        # Center the variables
+        x_centered = x - x.mean()
+        y_centered = y - y.mean()
+        
+        # Compute correlation
+        numerator = (x_centered * y_centered).sum()
+        denominator = torch.sqrt((x_centered ** 2).sum() * (y_centered ** 2).sum() + self.eps)
+        
+        return numerator / denominator
+    
+    def forward(self, preds, targets):
+        """
+        Args:
+            preds: (batch_size, num_labels) - model predictions
+            targets: (batch_size, num_labels) - ground truth labels
+            
+        Returns:
+            Scalar loss value (1 - mean correlation)
+        """
+        batch_size, num_labels = preds.shape
+        device = preds.device
+        
+        # Apply sigmoid to get probabilities
+        preds = torch.sigmoid(preds)
+        
+        correlations = []
+        
+        for label_idx in range(num_labels):
+            pred_col = preds[:, label_idx]
+            target_col = targets[:, label_idx]
+            
+            # Skip if all values are the same
+            if torch.std(pred_col) < 1e-6 or torch.std(target_col) < 1e-6:
+                continue
+            
+            # Compute soft ranks
+            pred_ranks = self.soft_rank(pred_col)
+            target_ranks = self.soft_rank(target_col)
+            
+            # Compute correlation between ranks
+            corr = self.pearson_correlation(pred_ranks, target_ranks)
+            correlations.append(corr)
+        
+        if len(correlations) > 0:
+            mean_corr = torch.stack(correlations).mean()
+            # Return 1 - correlation as loss (maximize correlation = minimize loss)
+            return 1.0 - mean_corr
+        else:
+            return torch.tensor(1.0, device=device, requires_grad=True)
+
+
+class CombinedRankingLoss(nn.Module):
+    """
+    Combined loss function for optimizing Spearman correlation.
+    
+    Combines:
+    1. Pairwise Ranking Loss - Directly optimizes pairwise ordering
+    2. Soft Spearman Loss - Differentiable approximation of Spearman correlation
+    
+    Both losses are designed to optimize for ranking, which is what
+    Spearman correlation measures.
+    """
+    
+    def __init__(
+        self,
+        ranking_weight=0.6,
+        spearman_weight=0.4,
+        ranking_margin=0.1,
+        ranking_threshold=0.05,
+        spearman_temperature=1.0
+    ):
+        """
+        Args:
+            ranking_weight: Weight for pairwise ranking loss
+            spearman_weight: Weight for soft spearman loss
+            ranking_margin: Margin for ranking loss
+            ranking_threshold: Threshold for significant pairs in ranking loss
+            spearman_temperature: Temperature for soft ranking
+        """
+        super().__init__()
+        
+        self.ranking_weight = ranking_weight
+        self.spearman_weight = spearman_weight
+        
+        self.ranking_loss = PairwiseRankingLoss(
+            margin=ranking_margin,
+            threshold=ranking_threshold
+        )
+        self.spearman_loss = SoftSpearmanLoss(
+            temperature=spearman_temperature
+        )
+    
+    def forward(self, preds, targets):
+        """
+        Args:
+            preds: (batch_size, num_labels) - model predictions (logits)
+            targets: (batch_size, num_labels) - ground truth labels
+            
+        Returns:
+            Dictionary with total loss and individual components
+        """
+        # Compute individual losses
+        ranking_loss = self.ranking_loss(preds, targets)
+        spearman_loss = self.spearman_loss(preds, targets)
+        
+        # Combine losses
+        total_loss = (
+            self.ranking_weight * ranking_loss +
+            self.spearman_weight * spearman_loss
+        )
+        
+        return {
+            'loss': total_loss,
+            'ranking_loss': ranking_loss.detach(),
+            'spearman_loss': spearman_loss.detach()
+        }
+
+
+# ==========================================
+# 3. Dataset Class (Optimized for ModernBERT)
 # ==========================================
 
 # Target column definitions
@@ -164,7 +425,7 @@ class QuestDatasetModernBERT(Dataset):
         self,
         data_df,
         tokenizer,
-        max_length: int = 512,
+        max_length: int = 2048,  # Increased default for ModernBERT
         target_cols: Optional[List[str]] = None,
         answer_ratio: float = 0.4,
         title_ratio: float = 0.3,
@@ -180,6 +441,7 @@ class QuestDatasetModernBERT(Dataset):
         body_transform: Optional[Callable] = None,
         answer_transform: Optional[Callable] = None,
         mode: str = "train",
+        preserve_full_text: bool = True,  # NEW: Try to preserve complete text when possible
     ):
         self.tokenizer = tokenizer
         self.max_length = max_length
@@ -188,6 +450,7 @@ class QuestDatasetModernBERT(Dataset):
         self.use_segment_markers = use_segment_markers
         self.use_detailed_markers = use_detailed_markers
         self.mode = mode
+        self.preserve_full_text = preserve_full_text  # NEW
         
         # Resolve target columns
         if target_cols is None:
@@ -268,35 +531,72 @@ class QuestDatasetModernBERT(Dataset):
         return title, body, answer
     
     @staticmethod
-    def _balance_segments(
-        first_len: int, 
-        second_len: int, 
-        second_ratio: float, 
-        max_length: int
-    ) -> Tuple[int, int]:
-        """Balance two segments to fit within max_length while respecting ratio preferences"""
-        first_budget = int((1 - second_ratio) * max_length)
-        second_budget = int(second_ratio * max_length)
+    def _balance_segments_adaptive(
+        first_tokens: List[int],
+        second_tokens: List[int],
+        second_ratio: float,
+        max_length: int,
+        preserve_full: bool = True
+    ) -> Tuple[List[int], List[int]]:
+        """
+        Adaptively balance two segments to fit within max_length.
         
-        # Allow unused budget to flow to the other segment
-        first_overflow = max(0, first_budget - first_len)
-        second_overflow = max(0, second_budget - second_len)
+        NEW: When preserve_full=True, tries to keep complete text if it fits,
+        only truncating when necessary. This better utilizes ModernBERT's long context.
         
-        final_first = min(first_len, first_budget + second_overflow)
-        final_second = min(second_len, second_budget + first_overflow)
+        Args:
+            first_tokens: Token IDs for first segment
+            second_tokens: Token IDs for second segment
+            second_ratio: Preferred ratio for second segment
+            max_length: Maximum total length
+            preserve_full: If True, prioritize keeping complete text
+            
+        Returns:
+            Truncated (first_tokens, second_tokens) tuples
+        """
+        first_len = len(first_tokens)
+        second_len = len(second_tokens)
+        total_len = first_len + second_len
+        
+        # If everything fits, keep it all (leverage long context!)
+        if total_len <= max_length:
+            return first_tokens, second_tokens
+        
+        if preserve_full:
+            # Adaptive truncation: truncate the longer segment first
+            overflow = total_len - max_length
+            
+            # Calculate how much each segment exceeds its "fair share"
+            first_budget = int((1 - second_ratio) * max_length)
+            second_budget = int(second_ratio * max_length)
+            
+            first_excess = max(0, first_len - first_budget)
+            second_excess = max(0, second_len - second_budget)
+            
+            if first_excess + second_excess > 0:
+                # Distribute truncation proportionally to excess
+                total_excess = first_excess + second_excess
+                first_cut = int(overflow * first_excess / total_excess)
+                second_cut = overflow - first_cut
+            else:
+                # Both within budget but still overflow - use ratio
+                first_cut = int(overflow * (1 - second_ratio))
+                second_cut = overflow - first_cut
+            
+            final_first = first_tokens[:max(1, first_len - first_cut)]
+            final_second = second_tokens[:max(1, second_len - second_cut)]
+        else:
+            # Original fixed-ratio logic
+            first_budget = int((1 - second_ratio) * max_length)
+            second_budget = int(second_ratio * max_length)
+            
+            first_overflow = max(0, first_budget - first_len)
+            second_overflow = max(0, second_budget - second_len)
+            
+            final_first = first_tokens[:min(first_len, first_budget + second_overflow)]
+            final_second = second_tokens[:min(second_len, second_budget + first_overflow)]
         
         return final_first, final_second
-    
-    def _encode_text(self, text: Optional[str], max_tokens: int) -> List[int]:
-        """Encode text to token IDs with length limit"""
-        if text is None or text == "":
-            return []
-        return self.tokenizer.encode(
-            str(text), 
-            max_length=max_tokens, 
-            truncation=True,
-            add_special_tokens=False
-        )
     
     def _prepare_features(
         self, 
@@ -309,10 +609,8 @@ class QuestDatasetModernBERT(Dataset):
         
         Format: [CLS] [QUESTION] title [SEP] body [SEP] [ANSWER] answer [SEP]
         
-        Note: ModernBERT doesn't use token_type_ids, so we rely on:
-        1. Explicit text markers ([QUESTION], [ANSWER])
-        2. SEP tokens for segment boundaries
-        3. The model's attention mechanism to learn segment relationships
+        UPDATED: Uses adaptive balancing to better utilize long context window.
+        When text is short enough, preserves everything. Only truncates when necessary.
         
         Returns:
             input_ids: Token IDs
@@ -326,28 +624,46 @@ class QuestDatasetModernBERT(Dataset):
         
         available_length = self.max_length - special_tokens_count - marker_tokens_count
         
-        # First, get raw token counts to determine balancing
-        title_tokens = self._encode_text(title, available_length)
-        body_tokens = self._encode_text(body, available_length)
-        answer_tokens = self._encode_text(answer, available_length)
+        # Tokenize all text WITHOUT truncation first (to see full lengths)
+        # This is key for adaptive balancing
+        title_tokens = self.tokenizer.encode(
+            str(title) if title else "", 
+            add_special_tokens=False,
+            truncation=False  # Don't truncate yet!
+        ) if title else []
         
-        # Balance question vs answer
-        question_len = len(title_tokens) + len(body_tokens)
-        answer_len = len(answer_tokens)
+        body_tokens = self.tokenizer.encode(
+            str(body) if body else "", 
+            add_special_tokens=False,
+            truncation=False
+        ) if body else []
         
-        final_question_len, final_answer_len = self._balance_segments(
-            question_len, answer_len, self.answer_ratio, available_length
+        answer_tokens = self.tokenizer.encode(
+            str(answer) if answer else "", 
+            add_special_tokens=False,
+            truncation=False
+        ) if answer else []
+        
+        # Combine title + body as "question" segment
+        # First balance title vs body within question budget
+        question_budget = int((1 - self.answer_ratio) * available_length)
+        title_tokens, body_tokens = self._balance_segments_adaptive(
+            title_tokens, 
+            body_tokens, 
+            1 - self.title_ratio,  # body gets more space
+            question_budget,
+            preserve_full=self.preserve_full_text
         )
         
-        # Balance title vs body within question budget
-        final_title_len, final_body_len = self._balance_segments(
-            len(title_tokens), len(body_tokens), 1 - self.title_ratio, final_question_len
+        # Now balance question (title+body) vs answer
+        question_tokens = title_tokens + ([self.tokenizer.sep_token_id] if title_tokens and body_tokens else []) + body_tokens
+        question_tokens, answer_tokens = self._balance_segments_adaptive(
+            question_tokens,
+            answer_tokens,
+            self.answer_ratio,
+            available_length,
+            preserve_full=self.preserve_full_text
         )
-        
-        # Truncate to final lengths
-        title_tokens = title_tokens[:final_title_len]
-        body_tokens = body_tokens[:final_body_len]
-        answer_tokens = answer_tokens[:final_answer_len]
         
         # Build input sequence
         input_ids = [self.tokenizer.cls_token_id]
@@ -356,19 +672,7 @@ class QuestDatasetModernBERT(Dataset):
         if self.use_segment_markers:
             input_ids.extend(self.question_marker_ids)
         
-        if title_tokens:
-            if self.use_detailed_markers:
-                input_ids.extend(self.title_marker_ids)
-            input_ids.extend(title_tokens)
-            
-        if body_tokens:
-            if self.use_detailed_markers:
-                input_ids.extend(self.body_marker_ids)
-            elif title_tokens:
-                # Add separator between title and body if no detailed markers
-                input_ids.append(self.tokenizer.sep_token_id)
-            input_ids.extend(body_tokens)
-        
+        input_ids.extend(question_tokens)
         input_ids.append(self.tokenizer.sep_token_id)
         
         # Add answer section
@@ -386,6 +690,10 @@ class QuestDatasetModernBERT(Dataset):
         if padding_length > 0:
             input_ids.extend([self.tokenizer.pad_token_id] * padding_length)
             attention_mask.extend([0] * padding_length)
+        elif padding_length < 0:
+            # Safety truncation (shouldn't happen with proper balancing)
+            input_ids = input_ids[:self.max_length]
+            attention_mask = attention_mask[:self.max_length]
         
         return input_ids, attention_mask
     
@@ -413,7 +721,7 @@ QuestDataset = QuestDatasetModernBERT
 
 
 # ==========================================
-# 3. Model Class
+# 4. Model Class
 # ==========================================
 class QuestModernBertModel(nn.Module):
     """ModernBERT model with weighted layer pooling and multi-sample dropout"""
@@ -428,12 +736,12 @@ class QuestModernBertModel(nn.Module):
             self.model = AutoModel.from_pretrained(
                 model_name, 
                 config=self.config,
-                attn_implementation="flash_attention_2",
+                attn_implementation="sdpa",
                 torch_dtype=torch.bfloat16
             )
-            print("✓ Using Flash Attention 2")
+            print("✓ Using PyTorch SDPA (Scaled Dot-Product Attention)")
         except Exception as e:
-            print(f"⚠ Flash Attention not available, using default attention: {e}")
+            print(f"⚠ PyTorch SDPA not available, using default attention: {e}")
             self.model = AutoModel.from_pretrained(model_name, config=self.config)
         
         # Weighted layer pooling with stable initialization
@@ -474,7 +782,7 @@ class QuestModernBertModel(nn.Module):
 
 
 # ==========================================
-# 4. Utilities
+# 5. Utilities
 # ==========================================
 def compute_spearmanr(trues, preds):
     """Compute mean Spearman correlation across all labels"""
@@ -550,9 +858,11 @@ def get_optimizer_params(model, encoder_lr, decoder_lr, weight_decay=0.01):
 
 
 def train_epoch(model, train_loader, optimizer, scheduler, loss_fn, device, accum_iter, scaler=None):
-    """Train one epoch with gradient accumulation and optional mixed precision"""
+    """Train one epoch with gradient accumulation and mixed precision (bfloat16)"""
     model.train()
     train_loss = 0
+    ranking_loss_sum = 0
+    spearman_loss_sum = 0
     optimizer.zero_grad()
     
     progress_bar = tqdm(train_loader, desc="Training")
@@ -561,16 +871,13 @@ def train_epoch(model, train_loader, optimizer, scheduler, loss_fn, device, accu
         mask = batch['attention_mask'].to(device)
         labels = batch['labels'].to(device)
 
-        # Mixed precision training if scaler is provided
-        if scaler is not None:
-            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                outputs = model(input_ids, mask)
-                # Ensure outputs are float32 for loss computation
-                outputs = outputs.float()
-                loss = loss_fn(outputs, labels)
-        else:
+        # Use bfloat16 autocast without GradScaler (bfloat16 is more stable)
+        with torch.cuda.amp.autocast(dtype=torch.bfloat16):
             outputs = model(input_ids, mask)
-            loss = loss_fn(outputs, labels)
+            # Ensure outputs are float32 for loss computation
+            outputs = outputs.float()
+            loss_dict = loss_fn(outputs, labels)
+            loss = loss_dict['loss']
         
         # Check for NaN loss
         if torch.isnan(loss) or torch.isinf(loss):
@@ -580,28 +887,24 @@ def train_epoch(model, train_loader, optimizer, scheduler, loss_fn, device, accu
         
         # Gradient accumulation
         loss = loss / accum_iter
-        
-        if scaler is not None:
-            scaler.scale(loss).backward()
-        else:
-            loss.backward()
+        loss.backward()
 
         if (step + 1) % accum_iter == 0:
             # Gradient clipping to prevent explosion
-            if scaler is not None:
-                scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
-            if scaler is not None:
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                optimizer.step()
+            optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
         
         train_loss += loss.item() * accum_iter
-        progress_bar.set_postfix({'loss': train_loss / (step + 1)})
+        ranking_loss_sum += loss_dict['ranking_loss'].item()
+        spearman_loss_sum += loss_dict['spearman_loss'].item()
+        
+        progress_bar.set_postfix({
+            'loss': train_loss / (step + 1),
+            'rank': ranking_loss_sum / (step + 1),
+            'spear': spearman_loss_sum / (step + 1)
+        })
     
     return train_loss / len(train_loader)
 
@@ -637,7 +940,7 @@ def validate(model, val_loader, device):
 
 
 # ==========================================
-# 5. Training Pipeline (K-Fold with Multi-GPU)
+# 6. Training Pipeline (K-Fold with Multi-GPU)
 # ==========================================
 def train_loop():
     """Main training pipeline with GroupKFold and multi-GPU support"""
@@ -648,6 +951,10 @@ def train_loop():
         raise ValueError(f"validation_split must be in (0, 1), got {Config.validation_split}")
     if Config.grouping_column not in ['question_title', 'qa_id', None]:
         print(f"⚠ Warning: Unusual grouping_column '{Config.grouping_column}'")
+    
+    # Append timestamp to output directory
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    Config.output_dir = f"{Config.output_dir}_{timestamp}"
     
     # Create output directory
     os.makedirs(Config.output_dir, exist_ok=True)
@@ -663,6 +970,14 @@ def train_loop():
         for i in range(torch.cuda.device_count()):
             print(f"  GPU {i}: {torch.cuda.get_device_name(i)}")
         print()
+    
+    # Print loss configuration
+    print("Loss Configuration:")
+    print(f"  Pairwise Ranking Loss weight: {Config.ranking_loss_weight}")
+    print(f"  Soft Spearman Loss weight: {Config.spearman_loss_weight}")
+    print(f"  Ranking margin: {Config.ranking_margin}")
+    print(f"  Ranking threshold: {Config.ranking_threshold}")
+    print(f"  Spearman temperature: {Config.spearman_temperature}\n")
     
     # ========================================
     # Select fold strategy based on n_folds
@@ -737,10 +1052,19 @@ def train_loop():
         optimizer_parameters = get_optimizer_params(model, encoder_lr=Config.lr, decoder_lr=Config.head_lr)
         
         optimizer = torch.optim.AdamW(optimizer_parameters, weight_decay=0.01)
-        loss_fn = nn.BCEWithLogitsLoss()
         
-        # Optional: Use gradient scaler for mixed precision
-        scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
+        # Use Combined Ranking Loss (optimized for Spearman correlation)
+        loss_fn = CombinedRankingLoss(
+            ranking_weight=Config.ranking_loss_weight,
+            spearman_weight=Config.spearman_loss_weight,
+            ranking_margin=Config.ranking_margin,
+            ranking_threshold=Config.ranking_threshold,
+            spearman_temperature=Config.spearman_temperature
+        )
+        
+        # Don't use GradScaler with bfloat16 (it's not needed and not supported)
+        # bfloat16 has better numerical stability than float16
+        scaler = None
         
         # Scheduler
         num_train_steps = int(len(train_loader) / Config.accum_iter * Config.epochs)
@@ -754,6 +1078,13 @@ def train_loop():
         best_model_path = os.path.join(Config.output_dir, f"best_model_fold{fold+1}.pth")
         patience_counter = 0
         patience = 3  # Early stopping patience
+        
+        # Track training history for this fold
+        training_history = {
+            'epochs': [],
+            'train_loss': [],
+            'val_score': []
+        }
 
         for epoch in range(Config.epochs):
             # Training
@@ -761,6 +1092,11 @@ def train_loop():
             
             # Validation
             val_score, val_preds, _ = validate(model, val_loader, device)
+            
+            # Record history
+            training_history['epochs'].append(epoch + 1)
+            training_history['train_loss'].append(float(train_loss))
+            training_history['val_score'].append(float(val_score))
             
             print(f"Epoch {epoch+1:2d}/{Config.epochs} | Loss: {train_loss:.4f} | Val Score: {val_score:.5f}", end="")
             
@@ -789,25 +1125,72 @@ def train_loop():
         else:
             print(f"\nFold {fold+1} best score: {best_score:.5f}")
         
+        # Save training history for this fold
+        history_path = os.path.join(Config.output_dir, f"training_history_fold{fold+1}.json")
+        with open(history_path, 'w') as f:
+            json.dump(training_history, f, indent=2)
+        print(f"Training history saved to: {history_path}")
+        
         # Clean up
         del model, optimizer, scheduler, train_loader, val_loader, scaler
         torch.cuda.empty_cache()
         gc.collect()
 
     # Calculate overall CV score
-    overall_score = compute_spearmanr(train_df[Config.target_cols].values, oof_preds)
-    print(f"\n{'='*50}")
-    print(f"Overall CV Spearman Score: {overall_score:.5f}")
-    print(f"{'='*50}\n")
+    if Config.n_folds == 1:
+        # For single split, only compute score on validation set (OOF contains only val predictions)
+        # The training set portion of oof_preds is still zeros, so we can't use the full array
+        val_idx = fold_splits[0][1]  # Get validation indices from the single split
+        overall_score = compute_spearmanr(
+            train_df.iloc[val_idx][Config.target_cols].values, 
+            oof_preds[val_idx]
+        )
+        print(f"\n{'='*50}")
+        print(f"Validation Spearman Score: {overall_score:.5f}")
+        print(f"{'='*50}\n")
+    else:
+        # For k-fold CV, all samples have OOF predictions
+        overall_score = compute_spearmanr(train_df[Config.target_cols].values, oof_preds)
+        print(f"\n{'='*50}")
+        print(f"Overall CV Spearman Score: {overall_score:.5f}")
+        print(f"{'='*50}\n")
     
     # Save OOF predictions
     np.save(os.path.join(Config.output_dir, "oof_preds.npy"), oof_preds)
+    
+    # Save overall training summary
+    summary = {
+        'model_name': Config.model_name,
+        'n_folds': Config.n_folds if Config.n_folds > 1 else 1,
+        'mode': 'cross_validation' if Config.n_folds > 1 else 'single_split',
+        'validation_split': Config.validation_split if Config.n_folds == 1 else None,
+        'epochs': Config.epochs,
+        'max_length': Config.max_len,
+        'batch_size': Config.batch_size,
+        'learning_rate': Config.lr,
+        'head_learning_rate': Config.head_lr,
+        'loss_configuration': {
+            'ranking_loss_weight': Config.ranking_loss_weight,
+            'spearman_loss_weight': Config.spearman_loss_weight,
+            'ranking_margin': Config.ranking_margin,
+            'ranking_threshold': Config.ranking_threshold,
+            'spearman_temperature': Config.spearman_temperature
+        },
+        'overall_cv_score': float(overall_score),
+        'num_samples': len(train_df),
+        'num_targets': len(Config.target_cols)
+    }
+    
+    summary_path = os.path.join(Config.output_dir, "training_summary.json")
+    with open(summary_path, 'w') as f:
+        json.dump(summary, f, indent=2)
+    print(f"Training summary saved to: {summary_path}\n")
     
     return oof_preds
 
 
 # ==========================================
-# 6. Post-processing Utilities (Winning Solution Approach)
+# 7. Post-processing Utilities (Winning Solution Approach)
 # ==========================================
 def postprocess_single_column(target, ref):
     """
@@ -919,7 +1302,7 @@ def postprocess_predictions(predictions, train_df, target_cols, use_distribution
 
 
 # ==========================================
-# 7. Inference Pipeline (Ensemble with Multi-GPU)
+# 8. Inference Pipeline (Ensemble with Multi-GPU)
 # ==========================================
 @torch.no_grad()
 def generate_predictions(model, test_loader, device):
@@ -1039,7 +1422,7 @@ def inference_pipeline(use_postprocessing=True):
 
 
 # ==========================================
-# 8. Main Entry Point
+# 9. Main Entry Point
 # ==========================================
 def main():
     """Main function to run training and/or inference"""
@@ -1059,6 +1442,18 @@ def main():
     parser.add_argument('--no_postprocessing', action='store_true',
                         help='Disable distribution matching post-processing')
     
+    # Loss configuration arguments
+    parser.add_argument('--ranking_weight', type=float, default=None,
+                        help='Weight for pairwise ranking loss')
+    parser.add_argument('--spearman_weight', type=float, default=None,
+                        help='Weight for soft spearman loss')
+    parser.add_argument('--ranking_margin', type=float, default=None,
+                        help='Margin for pairwise ranking loss')
+    parser.add_argument('--ranking_threshold', type=float, default=None,
+                        help='Threshold for significant pairs in ranking loss')
+    parser.add_argument('--spearman_temperature', type=float, default=None,
+                        help='Temperature for soft ranking in spearman loss')
+    
     args = parser.parse_args()
     
     # Override config if arguments provided
@@ -1072,6 +1467,18 @@ def main():
         Config.batch_size = args.batch_size
     if args.max_len:
         Config.max_len = args.max_len
+    
+    # Loss configuration overrides
+    if args.ranking_weight is not None:
+        Config.ranking_loss_weight = args.ranking_weight
+    if args.spearman_weight is not None:
+        Config.spearman_loss_weight = args.spearman_weight
+    if args.ranking_margin is not None:
+        Config.ranking_margin = args.ranking_margin
+    if args.ranking_threshold is not None:
+        Config.ranking_threshold = args.ranking_threshold
+    if args.spearman_temperature is not None:
+        Config.spearman_temperature = args.spearman_temperature
     
     # Set seed
     seed_everything(Config.seed)
@@ -1091,6 +1498,10 @@ def main():
     print(f"Batch Size: {Config.batch_size}")
     print(f"Post-processing: {'Disabled' if args.no_postprocessing else 'Enabled'}")
     print(f"Grouping: {Config.grouping_column or 'None'}")
+    print()
+    print("Loss Function: Combined Ranking Loss")
+    print(f"  - Pairwise Ranking: {Config.ranking_loss_weight:.1%} (margin={Config.ranking_margin}, threshold={Config.ranking_threshold})")
+    print(f"  - Soft Spearman: {Config.spearman_loss_weight:.1%} (temperature={Config.spearman_temperature})")
     print("="*50 + "\n")
     
     # Run training
