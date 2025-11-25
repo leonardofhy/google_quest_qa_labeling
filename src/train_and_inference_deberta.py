@@ -7,6 +7,7 @@ Overview:
 - Training: Fine-tune DeBERTa-v3-base on 30 Q&A quality labels
 - Inference: Generate predictions on test data with post-processing
 - Architecture: Weighted layer pooling + multi-sample dropout
+- Loss: Combined Pairwise Ranking Loss + Soft Spearman Loss (optimized for Spearman correlation)
 
 Usage:
     # Training
@@ -21,12 +22,15 @@ Usage:
 
 import os
 import gc
+import json
 import argparse
+from datetime import datetime
 from collections import Counter
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoTokenizer, AutoModel, AutoConfig, get_linear_schedule_with_warmup
 from scipy.stats import spearmanr
@@ -44,7 +48,7 @@ torch.autograd.set_detect_anomaly(False)
 # ==========================================
 class Config:
     """Training and model configuration"""
-    model_name = "microsoft/deberta-v3-base"
+    model_name = "microsoft/deberta-v3-large"
     
     max_len = 512
     batch_size = 16         
@@ -55,15 +59,22 @@ class Config:
     head_lr = 5e-5          # Reduced from 1e-4
     
     # Training configuration
-    epochs = 5              
-    n_folds = 5             # Number of folds for cross-validation (set to 1 for quick iteration)
+    epochs = 4              
+    n_folds = 1             # Set to 1 for fast iteration, 5 for final training with cross-validation
     validation_split = 0.2  # Only used when n_folds=1 (fast iteration mode)
     seed = 42
     num_workers = 8         # Increased from 2 for better data loading
     train_csv = "data/train.csv"
     test_csv = "data/test.csv"
     sample_submission_csv = "data/sample_submission.csv"
-    output_dir = "models/deberta_v3_base_5folds"
+    output_dir = "models/deberta_v3_large"  # Will be appended with timestamp in train_loop()
+    
+    # Loss configuration
+    ranking_loss_weight = 0.6    # Weight for pairwise ranking loss
+    spearman_loss_weight = 0.4   # Weight for soft spearman loss
+    ranking_margin = 0.1         # Margin for ranking loss
+    ranking_threshold = 0.05     # Only consider pairs with target difference > threshold
+    spearman_temperature = 1.0   # Temperature for soft ranking
     
     # Grouping strategy: Use question_title to prevent data leakage
     # (Same question can have multiple answers; we group them together)
@@ -94,7 +105,272 @@ def seed_everything(seed=42):
 
 
 # ==========================================
-# 2. Dataset Class
+# 2. Custom Loss Functions
+# ==========================================
+class PairwiseRankingLoss(nn.Module):
+    """
+    Pairwise Ranking Loss for optimizing Spearman correlation.
+    
+    For each pair (i, j) where target[i] > target[j], we want pred[i] > pred[j].
+    Uses margin ranking loss to enforce correct relative ordering.
+    
+    This directly optimizes for ranking, which is what Spearman correlation measures.
+    """
+    
+    def __init__(self, margin=0.1, threshold=0.05):
+        """
+        Args:
+            margin: Minimum difference required between pred[i] and pred[j]
+            threshold: Only consider pairs where |target[i] - target[j]| > threshold
+        """
+        super().__init__()
+        self.margin = margin
+        self.threshold = threshold
+    
+    def forward(self, preds, targets):
+        """
+        Args:
+            preds: (batch_size, num_labels) - model predictions (logits or sigmoid outputs)
+            targets: (batch_size, num_labels) - ground truth labels
+            
+        Returns:
+            Scalar loss value
+        """
+        batch_size, num_labels = preds.shape
+        device = preds.device
+        
+        # Apply sigmoid to get probabilities if needed
+        preds = torch.sigmoid(preds)
+        
+        total_loss = torch.tensor(0.0, device=device)
+        num_valid_pairs = 0
+        
+        # Process each label independently
+        for label_idx in range(num_labels):
+            pred_col = preds[:, label_idx]  # (batch_size,)
+            target_col = targets[:, label_idx]  # (batch_size,)
+            
+            # Create pairwise differences
+            # pred_diff[i, j] = pred[i] - pred[j]
+            pred_diff = pred_col.unsqueeze(1) - pred_col.unsqueeze(0)  # (batch_size, batch_size)
+            target_diff = target_col.unsqueeze(1) - target_col.unsqueeze(0)  # (batch_size, batch_size)
+            
+            # Only consider pairs where target difference is significant
+            # and i < j to avoid counting pairs twice
+            mask = (target_diff.abs() > self.threshold)
+            
+            # Get upper triangular mask to avoid duplicate pairs
+            upper_tri = torch.triu(torch.ones(batch_size, batch_size, device=device), diagonal=1).bool()
+            mask = mask & upper_tri
+            
+            if mask.sum() == 0:
+                continue
+            
+            # For pairs where target[i] > target[j], we want pred[i] > pred[j]
+            # Sign indicates direction: +1 if target[i] > target[j], -1 otherwise
+            sign = torch.sign(target_diff)
+            
+            # Margin ranking loss: max(0, margin - sign * (pred[i] - pred[j]))
+            # When sign = +1 and pred[i] > pred[j] + margin, loss = 0
+            # When sign = -1 and pred[j] > pred[i] + margin, loss = 0
+            loss_matrix = F.relu(self.margin - sign * pred_diff)
+            
+            # Apply mask and compute mean
+            masked_loss = loss_matrix[mask]
+            if masked_loss.numel() > 0:
+                total_loss = total_loss + masked_loss.sum()
+                num_valid_pairs += masked_loss.numel()
+        
+        if num_valid_pairs > 0:
+            return total_loss / num_valid_pairs
+        else:
+            return torch.tensor(0.0, device=device, requires_grad=True)
+
+
+class SoftSpearmanLoss(nn.Module):
+    """
+    Differentiable approximation of Spearman correlation loss.
+    
+    Uses soft ranking (sigmoid-based) to compute differentiable ranks,
+    then computes Pearson correlation between soft ranks.
+    
+    Loss = 1 - mean(correlation across labels)
+    """
+    
+    def __init__(self, temperature=1.0, eps=1e-8):
+        """
+        Args:
+            temperature: Controls sharpness of soft ranking (lower = sharper)
+            eps: Small value for numerical stability
+        """
+        super().__init__()
+        self.temperature = temperature
+        self.eps = eps
+    
+    def soft_rank(self, x):
+        """
+        Compute soft (differentiable) ranks using sigmoid approximation.
+        
+        For each element x[i], its soft rank is approximately:
+        rank[i] = sum_j sigmoid((x[i] - x[j]) / temperature)
+        
+        This gives a differentiable approximation to the rank of each element.
+        
+        Args:
+            x: (batch_size,) tensor
+            
+        Returns:
+            (batch_size,) tensor of soft ranks
+        """
+        batch_size = x.shape[0]
+        
+        # Compute pairwise differences: diff[i, j] = x[i] - x[j]
+        diff = x.unsqueeze(1) - x.unsqueeze(0)  # (batch_size, batch_size)
+        
+        # Apply sigmoid to get soft comparison
+        # sigmoid((x[i] - x[j]) / temp) ≈ 1 if x[i] > x[j], ≈ 0 if x[i] < x[j]
+        soft_compare = torch.sigmoid(diff / self.temperature)
+        
+        # Sum along columns to get soft rank
+        # Higher values get higher ranks
+        soft_ranks = soft_compare.sum(dim=1)  # (batch_size,)
+        
+        return soft_ranks
+    
+    def pearson_correlation(self, x, y):
+        """
+        Compute Pearson correlation between two tensors.
+        
+        Args:
+            x, y: (batch_size,) tensors
+            
+        Returns:
+            Scalar correlation value
+        """
+        # Center the variables
+        x_centered = x - x.mean()
+        y_centered = y - y.mean()
+        
+        # Compute correlation
+        numerator = (x_centered * y_centered).sum()
+        denominator = torch.sqrt((x_centered ** 2).sum() * (y_centered ** 2).sum() + self.eps)
+        
+        return numerator / denominator
+    
+    def forward(self, preds, targets):
+        """
+        Args:
+            preds: (batch_size, num_labels) - model predictions
+            targets: (batch_size, num_labels) - ground truth labels
+            
+        Returns:
+            Scalar loss value (1 - mean correlation)
+        """
+        batch_size, num_labels = preds.shape
+        device = preds.device
+        
+        # Apply sigmoid to get probabilities
+        preds = torch.sigmoid(preds)
+        
+        correlations = []
+        
+        for label_idx in range(num_labels):
+            pred_col = preds[:, label_idx]
+            target_col = targets[:, label_idx]
+            
+            # Skip if all targets are the same (correlation undefined)
+            if target_col.std() < self.eps:
+                continue
+            
+            # Compute soft ranks
+            pred_ranks = self.soft_rank(pred_col)
+            target_ranks = self.soft_rank(target_col)
+            
+            # Compute Pearson correlation between ranks (= Spearman correlation)
+            corr = self.pearson_correlation(pred_ranks, target_ranks)
+            
+            # Clamp correlation to valid range
+            corr = torch.clamp(corr, -1.0, 1.0)
+            
+            correlations.append(corr)
+        
+        if len(correlations) > 0:
+            mean_corr = torch.stack(correlations).mean()
+            # Loss = 1 - correlation (we want to maximize correlation, so minimize 1 - corr)
+            return 1.0 - mean_corr
+        else:
+            return torch.tensor(0.0, device=device, requires_grad=True)
+
+
+class CombinedRankingLoss(nn.Module):
+    """
+    Combined loss function for optimizing Spearman correlation.
+    
+    Combines:
+    1. Pairwise Ranking Loss - Directly optimizes pairwise ordering
+    2. Soft Spearman Loss - Differentiable approximation of Spearman correlation
+    
+    Both losses are designed to optimize for ranking, which is what
+    Spearman correlation measures.
+    """
+    
+    def __init__(
+        self,
+        ranking_weight=0.6,
+        spearman_weight=0.4,
+        ranking_margin=0.1,
+        ranking_threshold=0.05,
+        spearman_temperature=1.0
+    ):
+        """
+        Args:
+            ranking_weight: Weight for pairwise ranking loss
+            spearman_weight: Weight for soft spearman loss
+            ranking_margin: Margin for ranking loss
+            ranking_threshold: Threshold for significant pairs in ranking loss
+            spearman_temperature: Temperature for soft ranking
+        """
+        super().__init__()
+        
+        self.ranking_weight = ranking_weight
+        self.spearman_weight = spearman_weight
+        
+        self.ranking_loss = PairwiseRankingLoss(
+            margin=ranking_margin,
+            threshold=ranking_threshold
+        )
+        self.spearman_loss = SoftSpearmanLoss(
+            temperature=spearman_temperature
+        )
+    
+    def forward(self, preds, targets):
+        """
+        Args:
+            preds: (batch_size, num_labels) - model predictions (logits)
+            targets: (batch_size, num_labels) - ground truth labels
+            
+        Returns:
+            Dictionary with total loss and individual components
+        """
+        # Compute individual losses
+        ranking_loss = self.ranking_loss(preds, targets)
+        spearman_loss = self.spearman_loss(preds, targets)
+        
+        # Combine losses
+        total_loss = (
+            self.ranking_weight * ranking_loss +
+            self.spearman_weight * spearman_loss
+        )
+        
+        return {
+            'loss': total_loss,
+            'ranking_loss': ranking_loss.detach(),
+            'spearman_loss': spearman_loss.detach()
+        }
+
+
+# ==========================================
+# 3. Dataset Class
 # ==========================================
 class QuestDataset(Dataset):
     """Custom dataset for Q&A labeling task"""
@@ -172,7 +448,7 @@ class QuestDataset(Dataset):
 
 
 # ==========================================
-# 3. Model Class
+# 4. Model Class
 # ==========================================
 class QuestDebertaModel(nn.Module):
     """DeBERTa model with weighted layer pooling and multi-sample dropout"""
@@ -193,7 +469,7 @@ class QuestDebertaModel(nn.Module):
         # Multi-sample dropout
         self.dropouts = nn.ModuleList([nn.Dropout(0.5) for _ in range(5)])
         self.fc = nn.Linear(self.config.hidden_size, num_labels)
-        # Removed Sigmoid for BCEWithLogitsLoss stability
+        # Output logits - sigmoid will be applied in loss functions
 
     def forward(self, input_ids, attention_mask):
         outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
@@ -216,7 +492,7 @@ class QuestDebertaModel(nn.Module):
 
 
 # ==========================================
-# 4. Utilities
+# 5. Utilities
 # ==========================================
 def compute_spearmanr(trues, preds):
     """Compute mean Spearman correlation across all labels"""
@@ -278,6 +554,8 @@ def train_epoch(model, train_loader, optimizer, scheduler, loss_fn, device, accu
     """Train one epoch with gradient accumulation"""
     model.train()
     train_loss = 0
+    ranking_loss_sum = 0
+    spearman_loss_sum = 0
     optimizer.zero_grad()
     
     progress_bar = tqdm(train_loader, desc="Training")
@@ -287,7 +565,8 @@ def train_epoch(model, train_loader, optimizer, scheduler, loss_fn, device, accu
         labels = batch['labels'].to(device)
 
         outputs = model(input_ids, mask)
-        loss = loss_fn(outputs, labels)
+        loss_dict = loss_fn(outputs, labels)
+        loss = loss_dict['loss']
         
         # Check for NaN loss
         if torch.isnan(loss) or torch.isinf(loss):
@@ -307,7 +586,14 @@ def train_epoch(model, train_loader, optimizer, scheduler, loss_fn, device, accu
             optimizer.zero_grad()
         
         train_loss += loss.item() * accum_iter
-        progress_bar.set_postfix({'loss': train_loss / (step + 1)})
+        ranking_loss_sum += loss_dict['ranking_loss'].item()
+        spearman_loss_sum += loss_dict['spearman_loss'].item()
+        
+        progress_bar.set_postfix({
+            'loss': train_loss / (step + 1),
+            'rank': ranking_loss_sum / (step + 1),
+            'spear': spearman_loss_sum / (step + 1)
+        })
     
     return train_loss / len(train_loader)
 
@@ -325,7 +611,7 @@ def validate(model, val_loader, device):
         labels = batch['labels'].to(device)
         
         outputs = model(input_ids, mask)
-        # Apply sigmoid for metrics since we removed it from model
+        # Apply sigmoid for metrics since model outputs logits
         outputs = torch.sigmoid(outputs)
         
         val_preds.append(outputs.cpu().numpy())
@@ -343,7 +629,7 @@ def validate(model, val_loader, device):
 
 
 # ==========================================
-# 5. Training Pipeline (K-Fold with Multi-GPU)
+# 6. Training Pipeline (K-Fold with Multi-GPU)
 # ==========================================
 def train_loop():
     """Main training pipeline with GroupKFold and multi-GPU support"""
@@ -354,6 +640,10 @@ def train_loop():
         raise ValueError(f"validation_split must be in (0, 1), got {Config.validation_split}")
     if Config.grouping_column not in ['question_title', 'qa_id', None]:
         print(f"⚠ Warning: Unusual grouping_column '{Config.grouping_column}'")
+    
+    # Append timestamp to output directory
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    Config.output_dir = f"{Config.output_dir}_{timestamp}"
     
     # Create output directory
     os.makedirs(Config.output_dir, exist_ok=True)
@@ -369,6 +659,14 @@ def train_loop():
         for i in range(torch.cuda.device_count()):
             print(f"  GPU {i}: {torch.cuda.get_device_name(i)}")
         print()
+    
+    # Print loss configuration
+    print("Loss Configuration:")
+    print(f"  Pairwise Ranking Loss weight: {Config.ranking_loss_weight}")
+    print(f"  Soft Spearman Loss weight: {Config.spearman_loss_weight}")
+    print(f"  Ranking margin: {Config.ranking_margin}")
+    print(f"  Ranking threshold: {Config.ranking_threshold}")
+    print(f"  Spearman temperature: {Config.spearman_temperature}\n")
     
     # ========================================
     # Select fold strategy based on n_folds
@@ -443,7 +741,15 @@ def train_loop():
         optimizer_parameters = get_optimizer_params(model, encoder_lr=Config.lr, decoder_lr=Config.head_lr)
         
         optimizer = torch.optim.AdamW(optimizer_parameters, weight_decay=0.01)
-        loss_fn = nn.BCEWithLogitsLoss()
+        
+        # Combined Ranking Loss (Pairwise Ranking + Soft Spearman)
+        loss_fn = CombinedRankingLoss(
+            ranking_weight=Config.ranking_loss_weight,
+            spearman_weight=Config.spearman_loss_weight,
+            ranking_margin=Config.ranking_margin,
+            ranking_threshold=Config.ranking_threshold,
+            spearman_temperature=Config.spearman_temperature
+        )
         
         # Scheduler
         num_train_steps = int(len(train_loader) / Config.accum_iter * Config.epochs)
@@ -457,6 +763,16 @@ def train_loop():
         best_model_path = os.path.join(Config.output_dir, f"best_model_fold{fold+1}.pth")
         patience_counter = 0
         patience = 3  # Early stopping patience (increased for stability)
+        
+        # Initialize history tracking
+        history = {
+            'fold': fold + 1,
+            'epochs': [],
+            'train_loss': [],
+            'val_score': [],
+            'best_epoch': 0,
+            'best_score': -1.0
+        }
 
         for epoch in range(Config.epochs):
             # Training
@@ -465,11 +781,18 @@ def train_loop():
             # Validation
             val_score, val_preds, _ = validate(model, val_loader, device)
             
+            # Record history
+            history['epochs'].append(epoch + 1)
+            history['train_loss'].append(float(train_loss))
+            history['val_score'].append(float(val_score))
+            
             print(f"Epoch {epoch+1:2d}/{Config.epochs} | Loss: {train_loss:.4f} | Val Score: {val_score:.5f}", end="")
             
             # Save best model
             if val_score > best_score:
                 best_score = val_score
+                history['best_epoch'] = epoch + 1
+                history['best_score'] = float(best_score)
                 torch.save(model.state_dict(), best_model_path)
                 print(f" ✓ (New best)")
                 print(f"  Model saved to: {best_model_path}")
@@ -492,25 +815,70 @@ def train_loop():
         else:
             print(f"\nFold {fold+1} best score: {best_score:.5f}")
         
+        # Save training history to JSON
+        history_path = os.path.join(Config.output_dir, f"training_history_fold{fold+1}.json")
+        with open(history_path, 'w') as f:
+            json.dump(history, f, indent=2)
+        print(f"  Training history saved to: {history_path}")
+        
         # Clean up
         del model, optimizer, scheduler, train_loader, val_loader
         torch.cuda.empty_cache()
         gc.collect()
 
     # Calculate overall CV score
-    overall_score = compute_spearmanr(train_df[Config.target_cols].values, oof_preds)
+    if Config.n_folds == 1:
+        # For single split mode, only calculate on validation set
+        val_idx = fold_splits[0][1]  # Get validation indices from the single split
+        overall_score = compute_spearmanr(
+            train_df[Config.target_cols].values[val_idx], 
+            oof_preds[val_idx]
+        )
+        score_desc = "Validation Score (Single Split)"
+    else:
+        # For k-fold CV, all samples have OOF predictions
+        overall_score = compute_spearmanr(train_df[Config.target_cols].values, oof_preds)
+        score_desc = "Overall CV Spearman Score"
+    
     print(f"\n{'='*50}")
-    print(f"Overall CV Spearman Score: {overall_score:.5f}")
+    print(f"{score_desc}: {overall_score:.5f}")
     print(f"{'='*50}\n")
     
     # Save OOF predictions
     np.save(os.path.join(Config.output_dir, "oof_preds.npy"), oof_preds)
     
+    # Save overall training summary
+    summary = {
+        'model_name': Config.model_name,
+        'n_folds': Config.n_folds if Config.n_folds > 1 else 1,
+        'mode': 'cross_validation' if Config.n_folds > 1 else 'single_split',
+        'validation_split': Config.validation_split if Config.n_folds == 1 else None,
+        'epochs': Config.epochs,
+        'batch_size': Config.batch_size,
+        'learning_rate': Config.lr,
+        'head_learning_rate': Config.head_lr,
+        'loss_configuration': {
+            'ranking_loss_weight': Config.ranking_loss_weight,
+            'spearman_loss_weight': Config.spearman_loss_weight,
+            'ranking_margin': Config.ranking_margin,
+            'ranking_threshold': Config.ranking_threshold,
+            'spearman_temperature': Config.spearman_temperature
+        },
+        'overall_cv_score': float(overall_score),
+        'num_samples': len(train_df),
+        'num_targets': len(Config.target_cols)
+    }
+    
+    summary_path = os.path.join(Config.output_dir, "training_summary.json")
+    with open(summary_path, 'w') as f:
+        json.dump(summary, f, indent=2)
+    print(f"Training summary saved to: {summary_path}\n")
+    
     return oof_preds
 
 
 # ==========================================
-# 6. Post-processing Utilities (Winning Solution Approach)
+# 7. Post-processing Utilities (Winning Solution Approach)
 # ==========================================
 def postprocess_single_column(target, ref):
     """
@@ -626,7 +994,7 @@ def postprocess_predictions(predictions, train_df, target_cols, use_distribution
 
 
 # ==========================================
-# 7. Inference Pipeline (Ensemble with Multi-GPU)
+# 8. Inference Pipeline (Ensemble with Multi-GPU)
 # ==========================================
 @torch.no_grad()
 def generate_predictions(model, test_loader, device):
@@ -740,7 +1108,7 @@ def inference_pipeline(use_postprocessing=True):
 
 
 # ==========================================
-# 8. Main Entry Point
+# 9. Main Entry Point
 # ==========================================
 def main():
     """Main function to run training and/or inference"""
@@ -758,6 +1126,18 @@ def main():
     parser.add_argument('--no_postprocessing', action='store_true',
                         help='Disable distribution matching post-processing')
     
+    # Loss configuration arguments
+    parser.add_argument('--ranking_weight', type=float, default=None,
+                        help='Weight for pairwise ranking loss')
+    parser.add_argument('--spearman_weight', type=float, default=None,
+                        help='Weight for soft spearman loss')
+    parser.add_argument('--ranking_margin', type=float, default=None,
+                        help='Margin for pairwise ranking loss')
+    parser.add_argument('--ranking_threshold', type=float, default=None,
+                        help='Threshold for significant pairs in ranking loss')
+    parser.add_argument('--spearman_temperature', type=float, default=None,
+                        help='Temperature for soft ranking in spearman loss')
+    
     args = parser.parse_args()
     
     # Override config if arguments provided
@@ -769,6 +1149,18 @@ def main():
         Config.n_folds = args.n_folds
     if args.batch_size:
         Config.batch_size = args.batch_size
+    
+    # Loss configuration overrides
+    if args.ranking_weight is not None:
+        Config.ranking_loss_weight = args.ranking_weight
+    if args.spearman_weight is not None:
+        Config.spearman_loss_weight = args.spearman_weight
+    if args.ranking_margin is not None:
+        Config.ranking_margin = args.ranking_margin
+    if args.ranking_threshold is not None:
+        Config.ranking_threshold = args.ranking_threshold
+    if args.spearman_temperature is not None:
+        Config.spearman_temperature = args.spearman_temperature
     
     # Set seed
     seed_everything(Config.seed)
@@ -787,6 +1179,10 @@ def main():
     print(f"Batch Size: {Config.batch_size}")
     print(f"Post-processing: {'Disabled' if args.no_postprocessing else 'Enabled'}")
     print(f"Grouping: {Config.grouping_column or 'None'}")
+    print()
+    print("Loss Function: Combined Ranking Loss")
+    print(f"  - Pairwise Ranking: {Config.ranking_loss_weight:.1%} (margin={Config.ranking_margin}, threshold={Config.ranking_threshold})")
+    print(f"  - Soft Spearman: {Config.spearman_loss_weight:.1%} (temperature={Config.spearman_temperature})")
     print("="*50 + "\n")
     
     # Run training
