@@ -624,24 +624,32 @@ class QuestDatasetModernBERT(Dataset):
         
         available_length = self.max_length - special_tokens_count - marker_tokens_count
         
-        # Tokenize all text WITHOUT truncation first (to see full lengths)
-        # This is key for adaptive balancing
+        # ModernBERT's maximum position embedding limit
+        # We use this as a safe truncation limit to avoid tokenizer warnings
+        # while still allowing adaptive balancing within our desired max_length
+        safe_max_tokens = 8192
+        
+        # Tokenize all text with a safe maximum to avoid tokenizer warnings
+        # We'll do our own truncation in _balance_segments_adaptive
         title_tokens = self.tokenizer.encode(
             str(title) if title else "", 
             add_special_tokens=False,
-            truncation=False  # Don't truncate yet!
+            truncation=True,
+            max_length=safe_max_tokens
         ) if title else []
         
         body_tokens = self.tokenizer.encode(
             str(body) if body else "", 
             add_special_tokens=False,
-            truncation=False
+            truncation=True,
+            max_length=safe_max_tokens
         ) if body else []
         
         answer_tokens = self.tokenizer.encode(
             str(answer) if answer else "", 
             add_special_tokens=False,
-            truncation=False
+            truncation=True,
+            max_length=safe_max_tokens
         ) if answer else []
         
         # Combine title + body as "question" segment
@@ -737,7 +745,7 @@ class QuestModernBertModel(nn.Module):
                 model_name, 
                 config=self.config,
                 attn_implementation="sdpa",
-                torch_dtype=torch.bfloat16
+                dtype=torch.bfloat16
             )
             print("✓ Using PyTorch SDPA (Scaled Dot-Product Attention)")
         except Exception as e:
