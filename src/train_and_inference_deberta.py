@@ -55,15 +55,19 @@ class Config:
     head_lr = 5e-5          # Reduced from 1e-4
     
     # Training configuration
-    epochs = 3              # Reduced for fast iteration
-    n_folds = 1             # Single fold for fast testing (set to 5 for final training)
-    validation_split = 0.1  # 10% validation split when n_folds = 1
+    epochs = 5              
+    n_folds = 5             # Number of folds for cross-validation (set to 1 for quick iteration)
+    validation_split = 0.2  # Only used when n_folds=1 (fast iteration mode)
     seed = 42
     num_workers = 8         # Increased from 2 for better data loading
     train_csv = "data/train.csv"
     test_csv = "data/test.csv"
     sample_submission_csv = "data/sample_submission.csv"
-    output_dir = "models"
+    output_dir = "models/deberta_v3_base_5folds"
+    
+    # Grouping strategy: Use question_title to prevent data leakage
+    # (Same question can have multiple answers; we group them together)
+    grouping_column = 'question_title'
     
     target_cols = [
         'question_asker_intent_understanding', 'question_body_critical', 'question_conversational',
@@ -343,13 +347,21 @@ def validate(model, val_loader, device):
 # ==========================================
 def train_loop():
     """Main training pipeline with GroupKFold and multi-GPU support"""
+    # Validate configuration
+    if Config.n_folds < 1:
+        raise ValueError(f"n_folds must be >= 1, got {Config.n_folds}")
+    if not (0 < Config.validation_split < 1):
+        raise ValueError(f"validation_split must be in (0, 1), got {Config.validation_split}")
+    if Config.grouping_column not in ['question_title', 'qa_id', None]:
+        print(f"⚠ Warning: Unusual grouping_column '{Config.grouping_column}'")
+    
     # Create output directory
     os.makedirs(Config.output_dir, exist_ok=True)
     
     # Load data
     print("Loading data...")
     train_df = pd.read_csv(Config.train_csv)
-    print(f"Total samples: {len(train_df)}\n")
+    print(f"Total samples: {len(train_df):,}\n")
     
     # Check GPU availability
     if torch.cuda.is_available():
@@ -358,20 +370,49 @@ def train_loop():
             print(f"  GPU {i}: {torch.cuda.get_device_name(i)}")
         print()
     
-    # Choose between K-Fold and simple split based on n_folds
-    # Winner's strategy: Use question_title for grouping to better represent question topics
+    # ========================================
+    # Select fold strategy based on n_folds
+    # ========================================
     if Config.n_folds == 1:
-        # Fast single split for iteration testing
-        print("Using single train/val split for fast iteration")
-        print("Grouping by: question_title (winner's strategy)\n")
-        gss = GroupShuffleSplit(n_splits=1, test_size=Config.validation_split, random_state=Config.seed)
-        fold_splits = list(gss.split(train_df, train_df[Config.target_cols], groups=train_df['question_title']))
+        # FAST ITERATION MODE: Single train/val split
+        print("📍 FAST ITERATION MODE")
+        print(f"Using single train/val split (validation_split={Config.validation_split})")
+        if Config.grouping_column:
+            print(f"Grouping by: {Config.grouping_column} (prevents same-question leakage)\n")
+            gss = GroupShuffleSplit(
+                n_splits=1, 
+                test_size=Config.validation_split, 
+                random_state=Config.seed
+            )
+            fold_splits = list(gss.split(
+                train_df, 
+                train_df[Config.target_cols], 
+                groups=train_df[Config.grouping_column]
+            ))
+        else:
+            print("No grouping applied\n")
+            gss = GroupShuffleSplit(
+                n_splits=1, 
+                test_size=Config.validation_split, 
+                random_state=Config.seed
+            )
+            fold_splits = list(gss.split(train_df, train_df[Config.target_cols]))
     else:
-        # Full K-Fold for final training
+        # FINAL TRAINING MODE: K-Fold cross-validation
+        print("📍 FINAL TRAINING MODE")
         print(f"Using {Config.n_folds}-Fold Cross Validation")
-        print("Grouping by: question_title (winner's strategy)\n")
-        gkf = GroupKFold(n_splits=Config.n_folds)
-        fold_splits = list(gkf.split(train_df, train_df[Config.target_cols], groups=train_df['question_title']))
+        if Config.grouping_column:
+            print(f"Grouping by: {Config.grouping_column} (prevents same-question leakage)\n")
+            gkf = GroupKFold(n_splits=Config.n_folds)
+            fold_splits = list(gkf.split(
+                train_df, 
+                train_df[Config.target_cols], 
+                groups=train_df[Config.grouping_column]
+            ))
+        else:
+            print("No grouping applied\n")
+            gkf = GroupKFold(n_splits=Config.n_folds)
+            fold_splits = list(gkf.split(train_df, train_df[Config.target_cols]))
     
     # Store OOF predictions
     oof_preds = np.zeros((len(train_df), len(Config.target_cols)))
@@ -637,10 +678,13 @@ def inference_pipeline(use_postprocessing=True):
     # Ensemble predictions from all folds
     fold_preds = []
     
-    for fold in range(1, Config.n_folds + 1):
+    # Determine expected number of models
+    expected_folds = max(1, Config.n_folds)
+    
+    for fold in range(1, expected_folds + 1):
         model_path = os.path.join(Config.output_dir, f"best_model_fold{fold}.pth")
         if not os.path.exists(model_path):
-            print(f"⚠ Model for fold {fold} not found, skipping...")
+            print(f"⚠ Model for fold {fold} not found (expected path: {model_path})")
             continue
             
         print(f"Loading model fold {fold}...")
@@ -735,9 +779,14 @@ def main():
     print(f"Mode: {args.mode}")
     print(f"Model: {Config.model_name}")
     print(f"Epochs: {Config.epochs}")
-    print(f"Folds: {Config.n_folds}")
+    print(f"Folds: {Config.n_folds}", end="")
+    if Config.n_folds == 1:
+        print(f" (Fast iteration - using {Config.validation_split:.1%} validation split)")
+    else:
+        print(f" (Full cross-validation)")
     print(f"Batch Size: {Config.batch_size}")
     print(f"Post-processing: {'Disabled' if args.no_postprocessing else 'Enabled'}")
+    print(f"Grouping: {Config.grouping_column or 'None'}")
     print("="*50 + "\n")
     
     # Run training
