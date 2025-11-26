@@ -53,27 +53,27 @@ class Config:
     # model_name = "microsoft/deberta-v2-xxlarge"
     
     max_len = 512
-    batch_size = 8         
-    accum_iter = 2          
+    batch_size = 4          # Reduced for xxlarge model memory constraints
+    accum_iter = 4          # Increased to maintain effective batch size of 16
     
     # Lower LR for stability with large batch size
-    lr = 1e-5               # Reduced from 2e-5 to prevent gradient explosion
-    head_lr = 5e-5          # Reduced from 1e-4
+    lr = 1e-5               # Optimal for xxlarge model
+    head_lr = 5e-5          # Classification head LR
     
     # Training configuration
-    epochs = 10              
-    n_folds = 1             # Set to 1 for fast iteration, 5 for final training with cross-validation
+    epochs = 8              # Reduced to prevent overfitting (xxlarge prone to overfit)
+    n_folds = 5             # 5-fold CV for robust evaluation and ensemble
     validation_split = 0.2  # Only used when n_folds=1 (fast iteration mode)
     seed = 42
     num_workers = 8         # Increased from 2 for better data loading
     train_csv = "data/train.csv"
     test_csv = "data/test.csv"
     sample_submission_csv = "data/sample_submission.csv"
-    output_dir = "models/deberta_v3_large"  # Will be appended with timestamp in train_loop()
+    output_dir = "models/deberta_v2_xxlarge"  # Will be appended with timestamp in train_loop()
     
     # Loss configuration
-    ranking_loss_weight = 0.6    # Weight for pairwise ranking loss
-    spearman_loss_weight = 0.4   # Weight for soft spearman loss
+    ranking_loss_weight = 0.65   # Slightly increased for better ranking
+    spearman_loss_weight = 0.35  # Adjusted accordingly
     ranking_margin = 0.1         # Margin for ranking loss
     ranking_threshold = 0.05     # Only consider pairs with target difference > threshold
     spearman_temperature = 1.0   # Temperature for soft ranking
@@ -82,10 +82,7 @@ class Config:
     # (Same question can have multiple answers; we group them together)
     grouping_column = 'question_title'
     
-    # EMA (Exponential Moving Average) configuration
-    use_ema = True             # Disabled: causing training instability (val score drop from 0.38 to 0.05)
-    ema_decay = 0.9995          # Decay rate for EMA (higher = more smoothing, typical: 0.999-0.9999)
-    ema_start_epoch = 2         # Start applying EMA after this epoch (1-indexed)
+
     
     target_cols = [
         'question_asker_intent_understanding', 'question_body_critical', 'question_conversational',
@@ -111,64 +108,7 @@ def seed_everything(seed=42):
     torch.backends.cudnn.benchmark = False  # Disable for reproducibility
 
 
-# ==========================================
-# 1.5 EMA (Exponential Moving Average)
-# ==========================================
-class EMA:
-    """
-    Exponential Moving Average for model weights.
-    
-    EMA maintains a shadow copy of model weights that are exponentially averaged
-    during training. This typically improves generalization without additional
-    computational cost during inference.
-    
-    Key benefits:
-    - Smooths out weight oscillations
-    - Reduces overfitting
-    - Often improves validation performance by 0.002-0.008
-    """
-    
-    def __init__(self, model, decay=0.9995):
-        """
-        Args:
-            model: The model to apply EMA to
-            decay: Decay rate for EMA (higher = more weight to previous average)
-                   Typical range: 0.999-0.9999
-        """
-        self.model = model
-        self.decay = decay
-        self.shadow = {}
-        self.backup = {}
-        
-        # Initialize shadow weights with current model weights
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                self.shadow[name] = param.data.clone().detach()
-    
-    def update(self):
-        """Update shadow weights with exponential moving average"""
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                assert name in self.shadow, f"Parameter {name} not in shadow"
-                # EMA update: new_shadow = decay * old_shadow + (1 - decay) * current
-                new_average = self.decay * self.shadow[name] + (1.0 - self.decay) * param.data
-                self.shadow[name] = new_average.clone().detach()
-    
-    def apply_shadow(self):
-        """Temporarily replace model weights with EMA shadow weights"""
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                assert name in self.shadow, f"Parameter {name} not in shadow"
-                self.backup[name] = param.data.clone()
-                param.data = self.shadow[name].clone()
-    
-    def restore(self):
-        """Restore original model weights after using EMA weights"""
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                assert name in self.backup, f"Parameter {name} not in backup"
-                param.data = self.backup[name]
-        self.backup = {}
+
 
 
 # ==========================================
@@ -617,8 +557,8 @@ def get_optimizer_params(model, encoder_lr, decoder_lr, weight_decay=0.0):
     return optimizer_parameters
 
 
-def train_epoch(model, train_loader, optimizer, scheduler, loss_fn, device, accum_iter, ema=None):
-    """Train one epoch with gradient accumulation and optional EMA"""
+def train_epoch(model, train_loader, optimizer, scheduler, loss_fn, device, accum_iter):
+    """Train one epoch with gradient accumulation"""
     model.train()
     train_loss = 0
     ranking_loss_sum = 0
@@ -651,10 +591,6 @@ def train_epoch(model, train_loader, optimizer, scheduler, loss_fn, device, accu
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
-            
-            # Update EMA after optimizer step
-            if ema is not None:
-                ema.update()
         
         train_loss += loss.item() * accum_iter
         ranking_loss_sum += loss_dict['ranking_loss'].item()
@@ -670,14 +606,13 @@ def train_epoch(model, train_loader, optimizer, scheduler, loss_fn, device, accu
 
 
 @torch.no_grad()
-def validate(model, val_loader, device, use_ema=False):
-    """Validation loop with optional EMA"""
+def validate(model, val_loader, device):
+    """Validation loop"""
     model.eval()
     val_preds = []
     val_trues = []
     
-    desc = f"Validation{'(EMA)' if use_ema else ''}"
-    for batch in tqdm(val_loader, desc=desc):
+    for batch in tqdm(val_loader, desc="Validation"):
         input_ids = batch['input_ids'].to(device)
         mask = batch['attention_mask'].to(device)
         labels = batch['labels'].to(device)
@@ -834,13 +769,7 @@ def train_loop():
         best_score = -1.0
         best_model_path = os.path.join(Config.output_dir, f"best_model_fold{fold+1}.pth")
         patience_counter = 0
-        patience = 3  # Early stopping patience (increased for stability)
-        
-        # Initialize EMA if enabled
-        ema = None
-        if Config.use_ema:
-            ema = EMA(model, decay=Config.ema_decay)
-            print(f"✓ EMA enabled (decay={Config.ema_decay}, start_epoch={Config.ema_start_epoch})\n")
+        patience = 3  # Early stopping patience
         
         # Initialize history tracking
         history = {
@@ -849,28 +778,18 @@ def train_loop():
             'train_loss': [],
             'val_score': [],
             'best_epoch': 0,
-            'best_score': -1.0,
-            'ema_enabled': Config.use_ema,
-            'ema_decay': Config.ema_decay if Config.use_ema else None
+            'best_score': -1.0
         }
 
         for epoch in range(Config.epochs):
-            # Training with optional EMA
+            # Training
             train_loss = train_epoch(
                 model, train_loader, optimizer, scheduler, loss_fn, device, 
-                Config.accum_iter, 
-                ema=ema if epoch >= Config.ema_start_epoch else None
+                Config.accum_iter
             )
             
-            # Validation - try both with and without EMA if enabled
-            if Config.use_ema and epoch >= Config.ema_start_epoch:
-                # Validate with EMA weights
-                ema.apply_shadow()
-                val_score, val_preds, _ = validate(model, val_loader, device, use_ema=True)
-                ema.restore()
-            else:
-                # Normal validation without EMA
-                val_score, val_preds, _ = validate(model, val_loader, device, use_ema=False)
+            # Validation
+            val_score, val_preds, _ = validate(model, val_loader, device)
             
             # Record history
             history['epochs'].append(epoch + 1)
@@ -885,16 +804,8 @@ def train_loop():
                 history['best_epoch'] = epoch + 1
                 history['best_score'] = float(best_score)
                 
-                # Save model with EMA weights if enabled
-                if Config.use_ema and epoch >= Config.ema_start_epoch:
-                    ema.apply_shadow()
-                    torch.save(model.state_dict(), best_model_path)
-                    ema.restore()
-                    print(f" ✓ (New best, saved with EMA)")
-                else:
-                    torch.save(model.state_dict(), best_model_path)
-                    print(f" ✓ (New best)")
-                
+                torch.save(model.state_dict(), best_model_path)
+                print(f" ✓ (New best)")
                 print(f"  Model saved to: {best_model_path}")
                 patience_counter = 0
             else:
