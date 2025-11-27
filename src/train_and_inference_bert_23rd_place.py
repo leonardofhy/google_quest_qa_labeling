@@ -1,5 +1,7 @@
 import argparse
 import os
+import json
+from datetime import datetime
 import random
 import html
 import time
@@ -16,14 +18,38 @@ from torch.utils.data import DataLoader, TensorDataset
 from torch.optim import AdamW
 from transformers import BertTokenizer, BertModel, BertConfig, get_linear_schedule_with_warmup
 from scipy.stats import spearmanr
-from sklearn.model_selection import KFold
+from sklearn.model_selection import KFold, train_test_split
 import lightgbm as lgb
 from tqdm import tqdm
 
 # Suppress warnings
 warnings.filterwarnings("ignore")
 
-def seed_everything(seed=1234):
+class Config:
+    seed = 1234
+    max_sequence_length = 512
+    epochs = 3
+    q_epochs = 3
+    batch_size = 8
+    n_splits = 5
+    
+    # Optimizer
+    lr_bert = 5e-5
+    lr_head = 5e-4
+    weight_decay = 1e-2
+    
+    # Paths
+    data_dir = "data"
+    output_dir = "models" # Changed default to models as per user preference
+    train_csv = "train.csv"
+    test_csv = "test.csv"
+    sub_csv = "sample_submission.csv"
+    
+    # Local Eval
+    local_eval = False
+    test_size = 0.1
+
+def seed_everything(seed=Config.seed):
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
     np.random.seed(seed)
@@ -89,6 +115,33 @@ def compute_input_arrays(df, tokenizer, max_sequence_length, question_only=False
 
 def compute_output_arrays(df, output_categories):
     return np.asarray(df[output_categories])
+
+class Fold(object):
+    def __init__(self, n_splits=5, shuffle=True, random_state=71):
+        self.n_splits = n_splits
+        self.shuffle = shuffle
+        self.random_state = random_state
+
+    def get_groupkfold(self, train, group_name):
+        group = train[group_name]
+        unique_group = group.unique()
+
+        kf = KFold(
+            n_splits=self.n_splits,
+            shuffle=self.shuffle,
+            random_state=self.random_state
+        )
+        folds_ids = []
+        for trn_group_idx, val_group_idx in kf.split(unique_group):
+            trn_group = unique_group[trn_group_idx]
+            val_group = unique_group[val_group_idx]
+            is_trn = group.isin(trn_group)
+            is_val = group.isin(val_group)
+            trn_idx = train[is_trn].index
+            val_idx = train[is_val].index
+            folds_ids.append((trn_idx, val_idx))
+
+        return folds_ids
 
 class Model(nn.Module):
     def __init__(self, model_name='bert-base-uncased'):
@@ -165,14 +218,14 @@ def compute_spearmanr(trues, preds):
     return np.mean(rhos)
 
 def train_and_predict(train_data, valid_data, test_data, q_train_data, q_valid_data, q_test_data, 
-                      q_epochs, epochs, batch_size, fold, device, label_weights):
+                      fold, device, label_weights, output_dir, config):
     
-    dataloader = DataLoader(train_data, shuffle=True, batch_size=batch_size)
-    valid_dataloader = DataLoader(valid_data, shuffle=False, batch_size=batch_size)
-    test_dataloader = DataLoader(test_data, shuffle=False, batch_size=batch_size)
-    q_dataloader = DataLoader(q_train_data, shuffle=True, batch_size=batch_size)
-    q_valid_dataloader = DataLoader(q_valid_data, shuffle=False, batch_size=batch_size)
-    q_test_dataloader = DataLoader(q_test_data, shuffle=False, batch_size=batch_size)
+    dataloader = DataLoader(train_data, shuffle=True, batch_size=config.batch_size)
+    valid_dataloader = DataLoader(valid_data, shuffle=False, batch_size=config.batch_size)
+    test_dataloader = DataLoader(test_data, shuffle=False, batch_size=config.batch_size)
+    q_dataloader = DataLoader(q_train_data, shuffle=True, batch_size=config.batch_size)
+    q_valid_dataloader = DataLoader(q_valid_data, shuffle=False, batch_size=config.batch_size)
+    q_test_dataloader = DataLoader(q_test_data, shuffle=False, batch_size=config.batch_size)
 
     model = Model().to(device)
 
@@ -181,25 +234,24 @@ def train_and_predict(train_data, valid_data, test_data, q_train_data, q_valid_d
     optimizer_grouped_parameters = [
         {
             "params": [p for n, p in model.named_parameters() if p.requires_grad and not any(nd in n for nd in no_decay) and "bert" in n],
-            "weight_decay": 1e-2,
-            "lr": 5e-5
+            "weight_decay": config.weight_decay,
+            "lr": config.lr_bert
         },
         {
             "params": [p for n, p in model.named_parameters() if  p.requires_grad and any(nd in n for nd in no_decay) and "bert" in n], 
             "weight_decay": 0.0,
-            "lr": 5e-5
+            "lr": config.lr_bert
         },
         {
             "params": [p for n, p in model.named_parameters() if p.requires_grad and "bert" not in n],
-            "weight_decay": 1e-2,
-            "lr": 5e-4
-            
+            "weight_decay": config.weight_decay,
+            "lr": config.lr_head
         }
     ]
     optimizer = AdamW(optimizer_grouped_parameters)
     scheduler = get_linear_schedule_with_warmup(
-        optimizer, num_warmup_steps=int(len(q_dataloader) * (q_epochs) * 0.05),
-        num_training_steps=len(q_dataloader) * (q_epochs)
+        optimizer, num_warmup_steps=int(len(q_dataloader) * (config.q_epochs) * 0.05),
+        num_training_steps=len(q_dataloader) * (config.q_epochs)
     )
     
     test_predictions = []
@@ -207,13 +259,13 @@ def train_and_predict(train_data, valid_data, test_data, q_train_data, q_valid_d
 
     ## Question Only
     print(f"Fold {fold}: Training Question Only")
-    for epoch in range(q_epochs): 
+    for epoch in range(config.q_epochs): 
         start = time.time()
         model.train()
         train_losses = []
         train_preds = []
         train_targets = []
-        for input_ids, token_type_ids, attention_mask, targets in tqdm(q_dataloader, total=len(q_dataloader), desc=f"Epoch {epoch+1}/{q_epochs}"):
+        for input_ids, token_type_ids, attention_mask, targets in tqdm(q_dataloader, total=len(q_dataloader), desc=f"Epoch {epoch+1}/{config.q_epochs}"):
             input_ids = input_ids.to(device)
             token_type_ids = token_type_ids.to(device)
             attention_mask = attention_mask.to(device)
@@ -262,12 +314,30 @@ def train_and_predict(train_data, valid_data, test_data, q_train_data, q_valid_d
             test_predictions.append(np.stack(test_preds))
 
         print("Epoch {}: Train Loss {}, Valid Loss {}".format(epoch + 1, np.mean(train_losses), np.mean(valid_losses)))
+        train_spearman = compute_spearmanr(np.stack(train_targets), np.stack(train_preds))
+        valid_spearman_avg = compute_spearmanr(np.stack(valid_targets), sum(valid_predictions) / len(valid_predictions))
+        valid_spearman_last = compute_spearmanr(np.stack(valid_targets), valid_predictions[-1])
+        
         print("\t Train Spearmanr {:.4f}, Valid Spearmanr (avg) {:.4f}, Valid Spearmanr (last) {:.4f}".format(
-            compute_spearmanr(np.stack(train_targets), np.stack(train_preds)),
-            compute_spearmanr(np.stack(valid_targets), sum(valid_predictions) / len(valid_predictions)),
-            compute_spearmanr(np.stack(valid_targets), valid_predictions[-1])
+            train_spearman, valid_spearman_avg, valid_spearman_last
         ))
         print("\t elapsed: {}s".format(time.time() - start))
+
+        # Save model and logs
+        torch.save(model.state_dict(), os.path.join(output_dir, f"q_model_fold{fold}_epoch{epoch}.bin"))
+        log_entry = {
+            "fold": fold,
+            "phase": "question_only",
+            "epoch": epoch,
+            "train_loss": float(np.mean(train_losses)),
+            "valid_loss": float(np.mean(valid_losses)),
+            "train_spearman": float(train_spearman),
+            "valid_spearman_avg": float(valid_spearman_avg),
+            "valid_spearman_last": float(valid_spearman_last),
+            "timestamp": datetime.now().isoformat()
+        }
+        with open(os.path.join(output_dir, "training_log.jsonl"), "a") as f:
+            f.write(json.dumps(log_entry) + "\n")
 
     ## Q and A
     print(f"Fold {fold}: Training Q and A")
@@ -276,34 +346,33 @@ def train_and_predict(train_data, valid_data, test_data, q_train_data, q_valid_d
     optimizer_grouped_parameters = [
         {
             "params": [p for n, p in model.named_parameters() if p.requires_grad and not any(nd in n for nd in no_decay) and "bert" in n],
-            "weight_decay": 1e-2,
-            "lr": 5e-5
+            "weight_decay": config.weight_decay,
+            "lr": config.lr_bert
         },
         {
             "params": [p for n, p in model.named_parameters() if  p.requires_grad and any(nd in n for nd in no_decay) and "bert" in n], 
             "weight_decay": 0.0,
-            "lr": 5e-5
+            "lr": config.lr_bert
         },
         {
             "params": [p for n, p in model.named_parameters() if p.requires_grad and "bert" not in n],
-            "weight_decay": 1e-2,
-            "lr": 5e-4
-            
+            "weight_decay": config.weight_decay,
+            "lr": config.lr_head
         }
     ]
     optimizer = AdamW(optimizer_grouped_parameters)
     scheduler = get_linear_schedule_with_warmup(
-        optimizer, num_warmup_steps=int(len(dataloader) * (epochs) * 0.05),
-        num_training_steps=len(dataloader) * (epochs)
+        optimizer, num_warmup_steps=int(len(dataloader) * (config.epochs) * 0.05),
+        num_training_steps=len(dataloader) * (config.epochs)
     )
 
-    for epoch in range(epochs): 
+    for epoch in range(config.epochs): 
         start = time.time()
         model.train()
         train_losses = []
         train_preds = []
         train_targets = []
-        for input_ids, token_type_ids, attention_mask, targets in tqdm(dataloader, total=len(dataloader), desc=f"Epoch {epoch+1}/{epochs}"):
+        for input_ids, token_type_ids, attention_mask, targets in tqdm(dataloader, total=len(dataloader), desc=f"Epoch {epoch+1}/{config.epochs}"):
             input_ids = input_ids.to(device)
             token_type_ids = token_type_ids.to(device)
             attention_mask = attention_mask.to(device)
@@ -346,72 +415,99 @@ def train_and_predict(train_data, valid_data, test_data, q_train_data, q_valid_d
             test_predictions.append(np.stack(test_preds))
 
         print("Epoch {}: Train Loss {}, Valid Loss {}".format(epoch + 1, np.mean(train_losses), np.mean(valid_losses)))
+        train_spearman = compute_spearmanr(np.stack(train_targets), np.stack(train_preds))
+        valid_spearman_avg = compute_spearmanr(np.stack(valid_targets), sum(valid_predictions) / len(valid_predictions))
+        valid_spearman_last = compute_spearmanr(np.stack(valid_targets), valid_predictions[-1])
+
         print("\t Train Spearmanr {:.4f}, Valid Spearmanr (avg) {:.4f}, Valid Spearmanr (last) {:.4f}".format(
-            compute_spearmanr(np.stack(train_targets), np.stack(train_preds)),
-            compute_spearmanr(np.stack(valid_targets), sum(valid_predictions) / len(valid_predictions)),
-            compute_spearmanr(np.stack(valid_targets), valid_predictions[-1])
+            train_spearman, valid_spearman_avg, valid_spearman_last
         ))
         print("\t elapsed: {}s".format(time.time() - start))
+
+        # Save model and logs
+        torch.save(model.state_dict(), os.path.join(output_dir, f"qa_model_fold{fold}_epoch{epoch}.bin"))
+        log_entry = {
+            "fold": fold,
+            "phase": "qa",
+            "epoch": epoch,
+            "train_loss": float(np.mean(train_losses)),
+            "valid_loss": float(np.mean(valid_losses)),
+            "train_spearman": float(train_spearman),
+            "valid_spearman_avg": float(valid_spearman_avg),
+            "valid_spearman_last": float(valid_spearman_last),
+            "timestamp": datetime.now().isoformat()
+        }
+        with open(os.path.join(output_dir, "training_log.jsonl"), "a") as f:
+            f.write(json.dumps(log_entry) + "\n")
 
     return valid_predictions, test_predictions
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--debug", action="store_true", help="Run in debug mode with fewer data/epochs")
-    parser.add_argument("--data_dir", type=str, default="data", help="Directory containing train.csv and test.csv")
-    parser.add_argument("--output_dir", type=str, default=".", help="Directory to save submission")
+    parser.add_argument("--data_dir", type=str, default=Config.data_dir, help="Directory containing train.csv and test.csv")
+    parser.add_argument("--output_dir", type=str, default=Config.output_dir, help="Directory to save submission")
+    parser.add_argument("--local_eval", action="store_true", help="Run in local evaluation mode (split train into train/test)")
     args = parser.parse_args()
+
+    # Update Config with args
+    Config.data_dir = args.data_dir
+    Config.output_dir = args.output_dir
+    Config.local_eval = args.local_eval
 
     seed_everything()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Load Data
-    df_train = pd.read_csv(os.path.join(args.data_dir, "train.csv"))
-    df_test = pd.read_csv(os.path.join(args.data_dir, "test.csv"))
-    
-    if args.debug:
-        print("DEBUG MODE: Using subset of data")
-        df_train = df_train.head(100)
-        df_test = df_test.head(20)
-        q_epochs = 1
-        epochs = 1
-        batch_size = 4
-        n_splits = 2
-    else:
-        q_epochs = 3
-        epochs = 3
-        batch_size = 8
-        n_splits = 5
+    # Setup Output Directory
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    Config.output_dir = os.path.join(Config.output_dir, f"bert_23rd_place_{timestamp}")
+    os.makedirs(Config.output_dir, exist_ok=True)
+    print(f"Output directory: {Config.output_dir}")
 
+    # Load Data
+    df_train = pd.read_csv(os.path.join(Config.data_dir, Config.train_csv))
+    
+    if Config.local_eval:
+        print("LOCAL EVAL MODE: Splitting train.csv into train and local_test")
+        # Split train into train and holdout
+        df_train, df_test = train_test_split(df_train, test_size=Config.test_size, random_state=42)
+        print(f"Train shape: {df_train.shape}, Local Test shape: {df_test.shape}")
+        # Save local test targets for evaluation
+        local_test_targets = df_test[list(df_train.columns[11:])].values
+    else:
+        df_test = pd.read_csv(os.path.join(Config.data_dir, Config.test_csv))
+    
     output_categories = list(df_train.columns[11:])
     
     # Tokenizer
     tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
-    MAX_SEQUENCE_LENGTH = 512
 
     # Compute Inputs
     print("Computing input arrays...")
     outputs = torch.tensor(compute_output_arrays(df_train, output_categories), dtype=torch.float)
-    inputs = [torch.tensor(x, dtype=torch.long) for x in compute_input_arrays(df_train, tokenizer, MAX_SEQUENCE_LENGTH)]
-    question_only_inputs = [torch.tensor(x, dtype=torch.long) for x in compute_input_arrays(df_train, tokenizer, MAX_SEQUENCE_LENGTH, question_only=True)]
-    test_inputs = [torch.tensor(x, dtype=torch.long) for x in compute_input_arrays(df_test, tokenizer, MAX_SEQUENCE_LENGTH)]
-    test_question_only_inputs = [torch.tensor(x, dtype=torch.long) for x in compute_input_arrays(df_test, tokenizer, MAX_SEQUENCE_LENGTH, question_only=True)]
+    inputs = [torch.tensor(x, dtype=torch.long) for x in compute_input_arrays(df_train, tokenizer, Config.max_sequence_length)]
+    question_only_inputs = [torch.tensor(x, dtype=torch.long) for x in compute_input_arrays(df_train, tokenizer, Config.max_sequence_length, question_only=True)]
+    test_inputs = [torch.tensor(x, dtype=torch.long) for x in compute_input_arrays(df_test, tokenizer, Config.max_sequence_length)]
+    test_question_only_inputs = [torch.tensor(x, dtype=torch.long) for x in compute_input_arrays(df_test, tokenizer, Config.max_sequence_length, question_only=True)]
 
     # Label Weights
     LABEL_WEIGHTS = torch.tensor(1.0 / df_train[output_categories].std().values, dtype=torch.float32).to(device)
     LABEL_WEIGHTS = LABEL_WEIGHTS / LABEL_WEIGHTS.sum() * 30
 
     # KFold
-    kf = KFold(n_splits=n_splits, shuffle=True, random_state=71)
-    fold_ids = list(kf.split(df_train)) # Using simple KFold for simplicity, notebook used GroupKFold on URL but KFold is fine for general purpose
+    # kf = KFold(n_splits=Config.n_splits, shuffle=True, random_state=71)
+    # fold_ids = list(kf.split(df_train)) # Using simple KFold for simplicity, notebook used GroupKFold on URL but KFold is fine for general purpose
+    
+    # GroupKFold (Matching Notebook)
+    gkf = Fold(n_splits=Config.n_splits, shuffle=True, random_state=71)
+    fold_ids = gkf.get_groupkfold(df_train, group_name="url")
 
     histories = []
     test_dataset = TensorDataset(*test_inputs)
     q_test_dataset = TensorDataset(*test_question_only_inputs)
 
     for fold, (train_idx, valid_idx) in enumerate(fold_ids):
-        print(f"Starting Fold {fold+1}/{n_splits}")
+        print(f"Starting Fold {fold+1}/{Config.n_splits}")
         
         train_inputs_fold = [inputs[i][train_idx] for i in range(3)]
         q_train_inputs_fold = [question_only_inputs[i][train_idx] for i in range(3)]
@@ -432,8 +528,8 @@ def main():
             q_train_data=q_train_dataset, 
             q_valid_data=q_valid_dataset,
             q_test_data=q_test_dataset, 
-            q_epochs=q_epochs, epochs=epochs, batch_size=batch_size, fold=fold,
-            device=device, label_weights=LABEL_WEIGHTS
+            fold=fold,
+            device=device, label_weights=LABEL_WEIGHTS, output_dir=Config.output_dir, config=Config
         )
         histories.append(history)
 
@@ -479,9 +575,7 @@ def main():
 
     # LightGBM Stacking
     print("Training LightGBM Stacking...")
-    sub = pd.read_csv(os.path.join(args.data_dir, "sample_submission.csv"))
-    if args.debug:
-        sub = sub.head(20)
+    sub = pd.read_csv(os.path.join(Config.data_dir, Config.sub_csv))
         
     final_test_preds = []
     
@@ -531,7 +625,7 @@ def main():
             d_train = lgb.Dataset(x_trn_fold, label=y_trn_fold)
             d_valid = lgb.Dataset(x_val_fold, label=y_val_fold)
             
-            model = lgb.train(lgb_params, d_train, num_boost_round=100 if args.debug else 5000, 
+            model = lgb.train(lgb_params, d_train, num_boost_round=5000, 
                               valid_sets=[d_valid], 
                               callbacks=[lgb.early_stopping(stopping_rounds=20)])
             
@@ -541,8 +635,20 @@ def main():
         print(f"Finished LightGBM for {col_name}")
 
     sub.iloc[:, 1:] = np.array(final_test_preds).T
-    sub.to_csv(os.path.join(args.output_dir, "submission.csv"), index=False)
-    print("Submission saved to submission.csv")
+    sub.iloc[:, 1:] = np.array(final_test_preds).T
+    
+    if Config.local_eval:
+        print("\n" + "="*30)
+        print("LOCAL EVALUATION RESULTS")
+        print("="*30)
+        local_score = compute_spearmanr(local_test_targets, sub.iloc[:, 1:].values)
+        print(f"Simulated Public LB Score (Spearman): {local_score:.5f}")
+        print("="*30 + "\n")
+        sub.to_csv(os.path.join(Config.output_dir, "local_submission.csv"), index=False)
+        print("Local submission saved to local_submission.csv")
+    else:
+        sub.to_csv(os.path.join(Config.output_dir, "submission.csv"), index=False)
+        print("Submission saved to submission.csv")
 
 if __name__ == "__main__":
     main()
