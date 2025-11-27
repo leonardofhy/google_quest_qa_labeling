@@ -13,7 +13,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
-from transformers import BertTokenizer, BertModel, BertConfig, AdamW, get_linear_schedule_with_warmup
+from torch.optim import AdamW
+from transformers import BertTokenizer, BertModel, BertConfig, get_linear_schedule_with_warmup
 from scipy.stats import spearmanr
 from sklearn.model_selection import KFold
 import lightgbm as lgb
