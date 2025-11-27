@@ -81,9 +81,9 @@ class Config:
     
     # Loss configuration
     # Hybrid Loss: 50% BCE + 50% Ranking (Ranking split into Pairwise + Spearman)
-    bce_loss_weight = 1.0        # Weight for BCE Loss
-    ranking_loss_weight = 0.65   # Weight for Pairwise Ranking Loss
-    spearman_loss_weight = 0.35  # Weight for Soft Spearman Loss
+    bce_loss_weight = 0.5        # Reduced from 1.0 to let Ranking lead
+    ranking_loss_weight = 1.0    # Increased from 0.65 to restore primary focus
+    spearman_loss_weight = 0.5   # Increased from 0.35 for slight boost
     
     ranking_margin = 0.1         # Margin for ranking loss
     ranking_threshold = 0.05     # Only consider pairs with target difference > threshold
@@ -504,6 +504,11 @@ class QuestDataset(Dataset):
         return output
 
 
+
+# ==========================================
+# 4. Model Architecture
+# ==========================================
+
 class QuestDebertaModel(nn.Module):
     """
     DeBERTa model with Dual-Head Architecture (CLS + SEP pooling).
@@ -729,16 +734,10 @@ def validate(model, val_loader, device):
     
     score = compute_spearmanr(val_trues, val_preds)
     
-    # Apply post-processing (Target Distribution Matching)
-    val_preds_post = postprocess_prediction(
-        pd.DataFrame(val_preds, columns=Config.target_cols),
-        pd.DataFrame(val_trues, columns=Config.target_cols)
-    ).values
+    # Post-processing disabled for validation (noisy on small splits)
+    # val_preds_post = postprocess_prediction(...)
     
-    score_post = compute_spearmanr(val_trues, val_preds_post)
-    print(f"Validation Spearman: {score:.4f} -> Post-processed: {score_post:.4f}")
-    
-    return score_post, val_preds_post, val_trues
+    return score, val_preds, val_trues
 
 
 # ==========================================
