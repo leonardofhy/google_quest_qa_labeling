@@ -16,7 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 from torch.optim import AdamW
-from transformers import BertTokenizer, BertModel, BertConfig, get_linear_schedule_with_warmup
+from transformers import AutoTokenizer, AutoModel, AutoConfig, get_linear_schedule_with_warmup
 from scipy.stats import spearmanr
 from sklearn.model_selection import KFold, train_test_split
 import lightgbm as lgb
@@ -27,6 +27,7 @@ warnings.filterwarnings("ignore")
 
 class Config:
     seed = 1234
+    model_name = "bert-base-uncased"
     max_sequence_length = 512
     epochs = 3
     q_epochs = 3
@@ -40,7 +41,7 @@ class Config:
     
     # Paths
     data_dir = "data"
-    output_dir = "models" # Changed default to models as per user preference
+    output_dir = "models"
     train_csv = "train.csv"
     test_csv = "test.csv"
     sub_csv = "sample_submission.csv"
@@ -82,7 +83,7 @@ def _trim_input(question_tokens: List[str], answer_tokens: List[str], max_sequen
             raise ValueError("unreachable: q_len: {}, a_len: {}, q_max_len: {}, a_max_len: {}".format(q_len, a_len, q_max_len, a_max_len))
     return question_tokens, answer_tokens
 
-def _convert_to_transformer_inputs(title: str, question: str, answer: str, tokenizer: BertTokenizer, max_sequence_length: int, question_only=False):
+def _convert_to_transformer_inputs(title: str, question: str, answer: str, tokenizer, max_sequence_length: int, question_only=False):
     title = _preprocess_text(str(title))
     question = _preprocess_text(str(question))
     answer = _preprocess_text(str(answer))
@@ -144,24 +145,24 @@ class Fold(object):
         return folds_ids
 
 class Model(nn.Module):
-    def __init__(self, model_name='bert-base-uncased'):
+    def __init__(self, model_name=Config.model_name):
         super().__init__()
-        config = BertConfig.from_pretrained(model_name)
+        config = AutoConfig.from_pretrained(model_name)
         config.output_hidden_states = True
-        self.bert = BertModel.from_pretrained(model_name, config=config)
+        self.bert = AutoModel.from_pretrained(model_name, config=config)
         self.cls_token_head = nn.Sequential(
             nn.Dropout(0.1),
-            nn.Linear(768 * 4, 768),
+            nn.Linear(config.hidden_size * 4, config.hidden_size),
             nn.ReLU(inplace=True),
         )
         self.qa_sep_token_head = nn.Sequential(
             nn.Dropout(0.1),
-            nn.Linear(768 * 4, 768),
+            nn.Linear(config.hidden_size * 4, config.hidden_size),
             nn.ReLU(inplace=True),
         )
         self.linear = nn.Sequential(
             nn.Dropout(0.1),
-            nn.Linear(768 * 2, 30),
+            nn.Linear(config.hidden_size * 2, 30),
         )
         
     def forward(self, input_ids, attention_mask, token_type_ids):
@@ -471,6 +472,8 @@ def main():
         print("LOCAL EVAL MODE: Splitting train.csv into train and local_test")
         # Split train into train and holdout
         df_train, df_test = train_test_split(df_train, test_size=Config.test_size, random_state=42)
+        df_train = df_train.reset_index(drop=True)
+        df_test = df_test.reset_index(drop=True)
         print(f"Train shape: {df_train.shape}, Local Test shape: {df_test.shape}")
         # Save local test targets for evaluation
         local_test_targets = df_test[list(df_train.columns[11:])].values
@@ -480,7 +483,7 @@ def main():
     output_categories = list(df_train.columns[11:])
     
     # Tokenizer
-    tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+    tokenizer = AutoTokenizer.from_pretrained(Config.model_name)
 
     # Compute Inputs
     print("Computing input arrays...")
