@@ -5,7 +5,7 @@ import html
 import time
 import warnings
 from typing import List, Tuple
-from math import floor, ceil
+from math import floor
 
 import numpy as np
 import pandas as pd
@@ -198,8 +198,8 @@ def train_and_predict(train_data, valid_data, test_data, q_train_data, q_valid_d
     ]
     optimizer = AdamW(optimizer_grouped_parameters)
     scheduler = get_linear_schedule_with_warmup(
-        optimizer, num_warmup_steps=int(len(dataloader) * (q_epochs) * 0.05),
-        num_training_steps=len(dataloader) * (q_epochs)
+        optimizer, num_warmup_steps=int(len(q_dataloader) * (q_epochs) * 0.05),
+        num_training_steps=len(q_dataloader) * (q_epochs)
     )
     
     test_predictions = []
@@ -233,7 +233,8 @@ def train_and_predict(train_data, valid_data, test_data, q_train_data, q_valid_d
         valid_preds = []
         valid_targets = []
         with torch.no_grad():
-            for input_ids, token_type_ids, attention_mask, targets in valid_dataloader: # Use full valid dataloader for consistent eval
+            # Use q_valid_dataloader for question-only validation
+            for input_ids, token_type_ids, attention_mask, targets in q_valid_dataloader:
                 input_ids = input_ids.to(device)
                 token_type_ids = token_type_ids.to(device)
                 attention_mask = attention_mask.to(device)
@@ -249,7 +250,8 @@ def train_and_predict(train_data, valid_data, test_data, q_train_data, q_valid_d
             valid_predictions.append(np.stack(valid_preds))
             
             test_preds = []
-            for input_ids, token_type_ids, attention_mask in test_dataloader:
+            # Use q_test_dataloader for question-only test predictions
+            for input_ids, token_type_ids, attention_mask in q_test_dataloader:
                 input_ids = input_ids.to(device)
                 token_type_ids = token_type_ids.to(device)
                 attention_mask = attention_mask.to(device)
