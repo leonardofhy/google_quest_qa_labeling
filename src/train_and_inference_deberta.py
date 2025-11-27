@@ -46,6 +46,7 @@ torch.autograd.set_detect_anomaly(False)
 # ==========================================
 # 1. Configuration
 # ==========================================
+
 class Config:
     """Training and model configuration"""
     # model_name = "microsoft/deberta-v3-base" 
@@ -61,15 +62,17 @@ class Config:
     head_lr = 5e-5          # Classification head LR
     
     # Training configuration
-    epochs = 8              # Reduced to prevent overfitting (xxlarge prone to overfit)
-    n_folds = 5             # 5-fold CV for robust evaluation and ensemble
+    epochs = 4              # Reduced to prevent overfitting (xxlarge prone to overfit)
+    n_folds = 1             # 5-fold CV for robust evaluation and ensemble
     validation_split = 0.2  # Only used when n_folds=1 (fast iteration mode)
     seed = 42
     num_workers = 8         # Increased from 2 for better data loading
     train_csv = "data/train.csv"
     test_csv = "data/test.csv"
     sample_submission_csv = "data/sample_submission.csv"
-    output_dir = "models/deberta_v2_xxlarge"  # Will be appended with timestamp in train_loop()
+
+    output_dir = "models/deberta_v3_large"
+    # output_dir = "models/deberta_v2_xxlarge"
     
     # Loss configuration
     ranking_loss_weight = 0.65   # Slightly increased for better ranking
@@ -395,6 +398,41 @@ class QuestDataset(Dataset):
         if self.mode != "test":
             self.targets = df[Config.target_cols].values
 
+    def _trim_input_balanced(self, q_tokens, a_tokens, max_len):
+        """
+        Balanced trimming: preserve head and tail of both Q and A.
+        Based on 23rd place solution's insight that both beginning and end contain important info.
+        """
+        budget = max_len - 3  # [CLS], [SEP], [SEP]
+        q_max = budget // 2
+        a_max = budget // 2
+        
+        q_len = len(q_tokens)
+        a_len = len(a_tokens)
+        
+        if q_len + a_len <= budget:
+            return q_tokens, a_tokens
+        
+        # Redistribute budget based on actual lengths
+        if a_len <= a_max and q_len > q_max:
+            q_max = budget - a_len
+        elif q_len <= q_max and a_len > a_max:
+            a_max = budget - q_len
+        
+        # Balanced head-tail trimming for question
+        if q_len > q_max:
+            head_len = q_max // 2
+            tail_len = q_max - head_len
+            q_tokens = q_tokens[:head_len] + q_tokens[-tail_len:]
+        
+        # Balanced head-tail trimming for answer
+        if a_len > a_max:
+            head_len = a_max // 2
+            tail_len = a_max - head_len
+            a_tokens = a_tokens[:head_len] + a_tokens[-tail_len:]
+        
+        return q_tokens, a_tokens
+
     def __len__(self):
         return len(self.df)
 
@@ -411,54 +449,56 @@ class QuestDataset(Dataset):
         q_tokens = self.tokenizer.tokenize(q_text)
         a_tokens = self.tokenizer.tokenize(a_text)
         
-        # Dynamic truncation with budget awareness
-        budget = self.max_len - 3  # [CLS], [SEP], [SEP]
-        if len(q_tokens) + len(a_tokens) > budget:
-            half = budget // 2
-            if len(a_tokens) > half and len(q_tokens) > half:
-                a_tokens = a_tokens[:half]
-                q_tokens = q_tokens[:budget - len(a_tokens)]
-            elif len(a_tokens) <= half:
-                q_tokens = q_tokens[:budget - len(a_tokens)]
-            else:
-                a_tokens = a_tokens[:budget - len(q_tokens)]
-                
-        # Build input IDs
-        ids = [self.tokenizer.cls_token_id] + \
-              self.tokenizer.convert_tokens_to_ids(q_tokens) + \
-              [self.tokenizer.sep_token_id] + \
-              self.tokenizer.convert_tokens_to_ids(a_tokens) + \
-              [self.tokenizer.sep_token_id]
-              
+        # Balanced head-tail trimming (23rd place solution)
+        q_tokens, a_tokens = self._trim_input_balanced(q_tokens, a_tokens, self.max_len)
+        
+        # Build input IDs and track SEP position
+        cls_id = self.tokenizer.cls_token_id
+        sep_id = self.tokenizer.sep_token_id
+        pad_id = self.tokenizer.pad_token_id
+        
+        q_ids = self.tokenizer.convert_tokens_to_ids(q_tokens)
+        a_ids = self.tokenizer.convert_tokens_to_ids(a_tokens)
+        
+        # [CLS] + q_tokens + [SEP] + a_tokens + [SEP]
+        ids = [cls_id] + q_ids + [sep_id] + a_ids + [sep_id]
+        
+        # Position of the [SEP] between Q and A (for dual-head)
+        # This is the key position that captures Q-A interaction
+        sep_idx = len(q_ids) + 1  # 0-indexed: [CLS]=0, q_tokens=1..len(q_ids), [SEP]=len(q_ids)+1
+        
         mask = [1] * len(ids)
         padding_len = self.max_len - len(ids)
-        ids = ids + [self.tokenizer.pad_token_id] * padding_len
+        
+        ids = ids + [pad_id] * padding_len
         mask = mask + [0] * padding_len
         
         output = {
             'input_ids': torch.tensor(ids, dtype=torch.long),
-            'attention_mask': torch.tensor(mask, dtype=torch.long)
+            'attention_mask': torch.tensor(mask, dtype=torch.long),
+            'sep_idx': torch.tensor(sep_idx, dtype=torch.long),
         }
         
         if self.mode != "test":
-            # Add safety check and clipping with stricter bounds
             labels = self.targets[idx].copy()
-            labels = np.clip(labels, 0.0, 1.0)  # Ensure labels are in [0, 1]
-            labels = np.nan_to_num(labels, nan=0.5, posinf=1.0, neginf=0.0)  # Replace NaN/Inf
-            # Additional check for any remaining invalid values
-            if np.any(np.isnan(labels)) or np.any(np.isinf(labels)):
-                labels = np.where(np.isnan(labels) | np.isinf(labels), 0.5, labels)
-
+            labels = np.clip(labels, 0.0, 1.0)
+            labels = np.nan_to_num(labels, nan=0.5, posinf=1.0, neginf=0.0)
             output['labels'] = torch.tensor(labels, dtype=torch.float32)        
             
         return output
 
 
-# ==========================================
-# 4. Model Class
-# ==========================================
 class QuestDebertaModel(nn.Module):
-    """DeBERTa model with weighted layer pooling and multi-sample dropout"""
+    """
+    DeBERTa model with Dual-Head Architecture (CLS + SEP pooling).
+    
+    Key insight from 23rd place solution:
+    - [CLS] token captures overall document semantics
+    - [SEP] token (between Q and A) captures the Q-A interaction point
+    
+    Note: DeBERTa-v3 does NOT use token_type_ids, so we rely on
+    sep_idx computed in the Dataset to locate the Q-A boundary.
+    """
     
     def __init__(self, model_name=Config.model_name, num_labels=30):
         super().__init__()
@@ -466,36 +506,72 @@ class QuestDebertaModel(nn.Module):
         self.config.output_hidden_states = True
         self.model = AutoModel.from_pretrained(model_name, config=self.config)
         
-        # Weighted layer pooling with stable initialization
-        n_weights = self.config.num_hidden_layers + 1
-        weights_init = torch.zeros(n_weights).float()
-        weights_init.data[:-1] = -3
-        weights_init.data[-1] = 0  # Give more weight to last layer initially
-        self.layer_weights = nn.Parameter(weights_init)
+        hidden_size = self.config.hidden_size
         
-        # Multi-sample dropout
-        self.dropouts = nn.ModuleList([nn.Dropout(0.5) for _ in range(5)])
-        self.fc = nn.Linear(self.config.hidden_size, num_labels)
-        # Output logits - sigmoid will be applied in loss functions
+        # Dual-head: CLS token captures overall semantics, SEP token captures Q-A boundary
+        # Using last 4 layers concatenated (23rd place approach)
+        self.cls_head = nn.Sequential(
+            nn.Dropout(0.1),
+            nn.Linear(hidden_size * 4, hidden_size),
+            nn.GELU(),
+        )
+        
+        self.sep_head = nn.Sequential(
+            nn.Dropout(0.1),
+            nn.Linear(hidden_size * 4, hidden_size),
+            nn.GELU(),
+        )
+        
+        # Final classifier: concatenate CLS and SEP representations
+        self.classifier = nn.Sequential(
+            nn.Dropout(0.1),
+            nn.Linear(hidden_size * 2, num_labels),
+        )
 
-    def forward(self, input_ids, attention_mask):
-        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
-        hidden_states = outputs.hidden_states 
+    def forward(self, input_ids, attention_mask, sep_idx):
+        """
+        Forward pass with dual-head architecture.
         
-        # Stack [CLS] tokens
-        cls_outputs = torch.stack([layer[:, 0, :] for layer in hidden_states], dim=1)
+        Args:
+            input_ids: (batch, seq_len) token IDs
+            attention_mask: (batch, seq_len) attention mask
+            sep_idx: (batch,) position of [SEP] token between Q and A
+            
+        Returns:
+            logits: (batch, num_labels) classification logits
+        """
+        # DeBERTa-v3 does NOT use token_type_ids
+        outputs = self.model(
+            input_ids=input_ids, 
+            attention_mask=attention_mask,
+        )
+        hidden_states = outputs.hidden_states  # Tuple of (num_layers + 1) tensors
         
-        # Weighted sum
-        weights = torch.softmax(self.layer_weights, dim=0).view(1, -1, 1)
-        weighted_cls = (weights * cls_outputs).sum(dim=1)
+        # Extract last 4 layers (23rd place approach)
+        last_4_layers = hidden_states[-4:]  # 4 tensors of (batch, seq_len, hidden)
         
-        # Multi-sample dropout
-        logits_list = []
-        for dropout in self.dropouts:
-            logits_list.append(self.fc(dropout(weighted_cls)))
-        avg_logits = torch.mean(torch.stack(logits_list, dim=0), dim=0)
+        # CLS token: position 0
+        cls_embeddings = torch.cat([layer[:, 0, :] for layer in last_4_layers], dim=-1)
+        cls_out = self.cls_head(cls_embeddings)  # (batch, hidden)
         
-        return avg_logits
+        # SEP token: position varies per sample, use sep_idx
+        batch_size = input_ids.size(0)
+        batch_indices = torch.arange(batch_size, device=input_ids.device)
+        
+        sep_embeddings_list = []
+        for layer in last_4_layers:
+            # layer: (batch, seq_len, hidden)
+            sep_emb = layer[batch_indices, sep_idx]  # (batch, hidden)
+            sep_embeddings_list.append(sep_emb)
+        sep_embeddings = torch.cat(sep_embeddings_list, dim=-1)  # (batch, hidden * 4)
+        
+        sep_out = self.sep_head(sep_embeddings)  # (batch, hidden)
+        
+        # Concatenate CLS and SEP representations
+        combined = torch.cat([cls_out, sep_out], dim=-1)  # (batch, hidden * 2)
+        
+        logits = self.classifier(combined)
+        return logits
 
 
 # ==========================================
@@ -569,9 +645,10 @@ def train_epoch(model, train_loader, optimizer, scheduler, loss_fn, device, accu
     for step, batch in enumerate(progress_bar):
         input_ids = batch['input_ids'].to(device)
         mask = batch['attention_mask'].to(device)
+        sep_idx = batch['sep_idx'].to(device)
         labels = batch['labels'].to(device)
 
-        outputs = model(input_ids, mask)
+        outputs = model(input_ids, mask, sep_idx=sep_idx)
         loss_dict = loss_fn(outputs, labels)
         loss = loss_dict['loss']
         
@@ -615,10 +692,10 @@ def validate(model, val_loader, device):
     for batch in tqdm(val_loader, desc="Validation"):
         input_ids = batch['input_ids'].to(device)
         mask = batch['attention_mask'].to(device)
+        sep_idx = batch['sep_idx'].to(device)
         labels = batch['labels'].to(device)
         
-        outputs = model(input_ids, mask)
-        # Apply sigmoid for metrics since model outputs logits
+        outputs = model(input_ids, mask, sep_idx=sep_idx)
         outputs = torch.sigmoid(outputs)
         
         val_preds.append(outputs.cpu().numpy())
@@ -1016,8 +1093,9 @@ def generate_predictions(model, test_loader, device):
     for batch in tqdm(test_loader, desc="Inference"):
         input_ids = batch['input_ids'].to(device)
         mask = batch['attention_mask'].to(device)
+        sep_idx = batch['sep_idx'].to(device)
         
-        outputs = model(input_ids, mask)
+        outputs = model(input_ids, mask, sep_idx=sep_idx)
         outputs = torch.sigmoid(outputs)
         all_preds.append(outputs.cpu().numpy())
             
