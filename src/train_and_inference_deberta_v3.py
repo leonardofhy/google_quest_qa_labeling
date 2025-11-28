@@ -1,0 +1,697 @@
+import argparse
+import os
+import json
+from datetime import datetime
+import random
+import html
+import time
+import warnings
+from typing import List, Tuple
+from math import floor
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
+from torch.optim import AdamW
+from transformers import AutoTokenizer, AutoModel, AutoConfig, get_linear_schedule_with_warmup
+from scipy.stats import spearmanr
+from sklearn.model_selection import KFold, train_test_split
+import lightgbm as lgb
+from tqdm import tqdm
+
+# Suppress warnings
+warnings.filterwarnings("ignore")
+
+class Config:
+    seed = 42
+    model_name = "microsoft/deberta-v3-base"
+    max_sequence_length = 512
+    epochs = 3
+    q_epochs = 3
+    batch_size = 8 
+    n_splits = 5
+    
+    # Optimizer
+    lr_bert = 2e-5
+    lr_head = 1e-4
+    weight_decay = 1e-2
+    
+    # Paths
+    data_dir = "data"
+    output_dir = "models"
+    train_csv = "train.csv"
+    test_csv = "test.csv"
+    sub_csv = "sample_submission.csv"
+    
+    # Local Eval
+    local_eval = False
+    test_size = 0.1
+
+def seed_everything(seed=Config.seed):
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+
+def _preprocess_text(s: str) -> str:
+    return html.unescape(s)
+
+def _convert_to_transformer_inputs(title: str, question: str, answer: str, tokenizer, max_sequence_length: int, question_only=False):
+    title = _preprocess_text(str(title))
+    question = _preprocess_text(str(question))
+    answer = _preprocess_text(str(answer))
+    
+    text_a = f"{title} {question}"
+    text_b = answer if not question_only else None
+    
+    inputs = tokenizer.encode_plus(
+        text_a,
+        text_b,
+        add_special_tokens=True,
+        max_length=max_sequence_length,
+        padding="max_length",
+        truncation=True,
+        return_token_type_ids=True
+    )
+    
+    return inputs["input_ids"], inputs["token_type_ids"], inputs["attention_mask"]
+
+def compute_input_arrays(df, tokenizer, max_sequence_length, question_only=False):
+    input_ids, input_token_type_ids, input_attention_masks = [], [], []
+    for title, body, answer in tqdm(zip(df["question_title"].values, df["question_body"].values, df["answer"].values), total=len(df), desc="Tokenizing"):
+        ids, type_ids, mask = _convert_to_transformer_inputs(title, body, answer, tokenizer, max_sequence_length, question_only=question_only)
+        input_ids.append(ids)
+        input_token_type_ids.append(type_ids)
+        input_attention_masks.append(mask)
+    return (
+        np.asarray(input_ids, dtype=np.int32),
+        np.asarray(input_token_type_ids, dtype=np.int32),
+        np.asarray(input_attention_masks, dtype=np.int32),
+    )
+
+def compute_output_arrays(df, output_categories):
+    return np.asarray(df[output_categories])
+
+class Fold(object):
+    def __init__(self, n_splits=5, shuffle=True, random_state=71):
+        self.n_splits = n_splits
+        self.shuffle = shuffle
+        self.random_state = random_state
+
+    def get_groupkfold(self, train, group_name):
+        group = train[group_name]
+        unique_group = group.unique()
+
+        kf = KFold(
+            n_splits=self.n_splits,
+            shuffle=self.shuffle,
+            random_state=self.random_state
+        )
+        folds_ids = []
+        for trn_group_idx, val_group_idx in kf.split(unique_group):
+            trn_group = unique_group[trn_group_idx]
+            val_group = unique_group[val_group_idx]
+            is_trn = group.isin(trn_group)
+            is_val = group.isin(val_group)
+            trn_idx = train[is_trn].index
+            val_idx = train[is_val].index
+            folds_ids.append((trn_idx, val_idx))
+
+        return folds_ids
+
+class Model(nn.Module):
+    def __init__(self, model_name=Config.model_name):
+        super().__init__()
+        config = AutoConfig.from_pretrained(model_name)
+        config.output_hidden_states = True
+        self.bert = AutoModel.from_pretrained(model_name, config=config)
+        self.config = config
+        
+        # Simple Mean Pooling Head
+        self.linear = nn.Sequential(
+            nn.Dropout(0.1),
+            nn.Linear(config.hidden_size, 30),
+        )
+        
+    def forward(self, input_ids, attention_mask, token_type_ids):
+        # DeBERTa v3 handles token_type_ids automatically if passed, but for safety we can pass them.
+        outputs = self.bert(input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
+        
+        # Mean Pooling
+        last_hidden_state = outputs.last_hidden_state # [batch, seq_len, hidden]
+        input_mask_expanded = attention_mask.unsqueeze(-1).expand(last_hidden_state.size()).float()
+        sum_embeddings = torch.sum(last_hidden_state * input_mask_expanded, 1)
+        sum_mask = input_mask_expanded.sum(1)
+        sum_mask = torch.clamp(sum_mask, min=1e-9)
+        mean_embeddings = sum_embeddings / sum_mask
+        
+        x = self.linear(mean_embeddings)
+        return x
+
+def compute_loss(outputs, targets, label_weights, alpha=0.5, margin=0.1, question_only=False):
+    if question_only:
+        outputs = outputs[:, :21]
+        targets = targets[:, :21]
+        current_label_weights = label_weights[:21]
+    else:
+        current_label_weights = label_weights
+
+    bce = F.binary_cross_entropy_with_logits(outputs, targets, reduction="none")
+    bce = (bce * current_label_weights).mean()
+    
+    batch_size = outputs.size(0)
+    if batch_size % 2 == 0:
+        outputs1, outputs2 = outputs.sigmoid().contiguous().view(2, batch_size // 2, outputs.size(-1))
+        targets1, targets2 = targets.contiguous().view(2, batch_size // 2, outputs.size(-1))
+        # 1 if first ones are larger, -1 if second ones are larger, and 0 if equals.
+        ordering = (targets1 > targets2).float() - (targets1 < targets2).float()
+        margin_rank_loss = (-ordering * (outputs1 - outputs2) + margin).clamp(min=0.0)
+        margin_rank_loss = (margin_rank_loss * current_label_weights).mean()
+    else:
+        # batch size is not even number, so we can't devide them into pairs.
+        margin_rank_loss = torch.tensor(0.0, device=outputs.device)
+
+    return alpha * bce + (1 - alpha) * margin_rank_loss
+
+def compute_spearmanr(trues, preds):
+    rhos = []
+    for col_trues, col_pred in zip(trues.T, preds.T):
+        if len(np.unique(col_pred)) == 1:
+            col_pred[np.random.randint(0, len(col_pred) - 1)] = col_pred.max() + 1
+        rhos.append(spearmanr(col_trues, col_pred).correlation)
+    return np.mean(rhos)
+
+def save_config(config, output_dir):
+    """Save configuration to JSON file"""
+    config_dict = {
+        "seed": config.seed,
+        "model_name": config.model_name,
+        "max_sequence_length": config.max_sequence_length,
+        "epochs": config.epochs,
+        "q_epochs": config.q_epochs,
+        "batch_size": config.batch_size,
+        "n_splits": config.n_splits,
+        "lr_bert": config.lr_bert,
+        "lr_head": config.lr_head,
+        "weight_decay": config.weight_decay,
+        "data_dir": config.data_dir,
+        "output_dir": config.output_dir,
+        "local_eval": config.local_eval,
+        "test_size": config.test_size,
+        "timestamp": datetime.now().isoformat()
+    }
+    with open(os.path.join(output_dir, "config.json"), "w") as f:
+        json.dump(config_dict, f, indent=2)
+    print(f"Configuration saved to {os.path.join(output_dir, 'config.json')}")
+
+def train_and_predict(train_data, valid_data, test_data, q_train_data, q_valid_data, q_test_data, 
+                      fold, device, label_weights, output_dir, config):
+    
+    dataloader = DataLoader(train_data, shuffle=True, batch_size=config.batch_size)
+    valid_dataloader = DataLoader(valid_data, shuffle=False, batch_size=config.batch_size)
+    test_dataloader = DataLoader(test_data, shuffle=False, batch_size=config.batch_size)
+    q_dataloader = DataLoader(q_train_data, shuffle=True, batch_size=config.batch_size)
+    q_valid_dataloader = DataLoader(q_valid_data, shuffle=False, batch_size=config.batch_size)
+    q_test_dataloader = DataLoader(q_test_data, shuffle=False, batch_size=config.batch_size)
+
+    model = Model().to(device)
+
+    # Prepare optimizer and schedule (linear warmup and decay)
+    no_decay = ["bias", "LayerNorm.weight"]
+    optimizer_grouped_parameters = [
+        {
+            "params": [p for n, p in model.named_parameters() if p.requires_grad and not any(nd in n for nd in no_decay) and "bert" in n],
+            "weight_decay": config.weight_decay,
+            "lr": config.lr_bert
+        },
+        {
+            "params": [p for n, p in model.named_parameters() if  p.requires_grad and any(nd in n for nd in no_decay) and "bert" in n], 
+            "weight_decay": 0.0,
+            "lr": config.lr_bert
+        },
+        {
+            "params": [p for n, p in model.named_parameters() if p.requires_grad and "bert" not in n],
+            "weight_decay": config.weight_decay,
+            "lr": config.lr_head
+        }
+    ]
+    optimizer = AdamW(optimizer_grouped_parameters)
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer, num_warmup_steps=int(len(q_dataloader) * (config.q_epochs) * 0.05),
+        num_training_steps=len(q_dataloader) * (config.q_epochs)
+    )
+    
+    test_predictions = []
+    valid_predictions = []
+
+    ## Question Only
+    print(f"Fold {fold}: Training Question Only")
+    for epoch in range(config.q_epochs): 
+        start = time.time()
+        model.train()
+        train_losses = []
+        train_preds = []
+        train_targets = []
+        for input_ids, token_type_ids, attention_mask, targets in tqdm(q_dataloader, total=len(q_dataloader), desc=f"Epoch {epoch+1}/{config.q_epochs}"):
+            input_ids = input_ids.to(device)
+            token_type_ids = token_type_ids.to(device)
+            attention_mask = attention_mask.to(device)
+            targets = targets.to(device)
+            outputs = model(input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
+            train_preds.extend(outputs.detach().sigmoid().cpu().numpy())
+            train_targets.extend(targets.detach().cpu().numpy())
+            loss = compute_loss(outputs, targets, label_weights, question_only=True)
+            model.zero_grad()
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+            train_losses.append(loss.detach().cpu().item())
+        
+        model.eval()
+        valid_losses = []
+        valid_preds = []
+        valid_targets = []
+        with torch.no_grad():
+            # Use q_valid_dataloader for question-only validation
+            for input_ids, token_type_ids, attention_mask, targets in q_valid_dataloader:
+                input_ids = input_ids.to(device)
+                token_type_ids = token_type_ids.to(device)
+                attention_mask = attention_mask.to(device)
+                targets = targets.to(device)
+                outputs = model(input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
+                prob = outputs.sigmoid()
+                prob[:, 21:] = 0.0 # Zero out answer predictions
+                valid_preds.extend(prob.cpu().numpy())
+                valid_targets.extend(targets.cpu().numpy())
+                loss = compute_loss(outputs, targets, label_weights, question_only=True)
+                valid_losses.append(loss.detach().cpu().item())
+            
+            valid_predictions.append(np.stack(valid_preds))
+            
+            test_preds = []
+            # Use q_test_dataloader for question-only test predictions
+            for input_ids, token_type_ids, attention_mask in q_test_dataloader:
+                input_ids = input_ids.to(device)
+                token_type_ids = token_type_ids.to(device)
+                attention_mask = attention_mask.to(device)
+                outputs = model(input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
+                prob = outputs.sigmoid()
+                prob[:, 21:] = 0.0
+                test_preds.extend(prob.cpu().numpy())
+            test_predictions.append(np.stack(test_preds))
+
+        print("Epoch {}: Train Loss {}, Valid Loss {}".format(epoch + 1, np.mean(train_losses), np.mean(valid_losses)))
+        train_spearman = compute_spearmanr(np.stack(train_targets), np.stack(train_preds))
+        valid_spearman_avg = compute_spearmanr(np.stack(valid_targets), sum(valid_predictions) / len(valid_predictions))
+        valid_spearman_last = compute_spearmanr(np.stack(valid_targets), valid_predictions[-1])
+        
+        print("\t Train Spearmanr {:.4f}, Valid Spearmanr (avg) {:.4f}, Valid Spearmanr (last) {:.4f}".format(
+            train_spearman, valid_spearman_avg, valid_spearman_last
+        ))
+        print("\t elapsed: {}s".format(time.time() - start))
+
+        # Save model and logs
+        torch.save(model.state_dict(), os.path.join(output_dir, f"q_model_fold{fold}_epoch{epoch}.bin"))
+        log_entry = {
+            "fold": fold,
+            "phase": "question_only",
+            "epoch": epoch,
+            "train_loss": float(np.mean(train_losses)),
+            "valid_loss": float(np.mean(valid_losses)),
+            "train_spearman": float(train_spearman),
+            "valid_spearman_avg": float(valid_spearman_avg),
+            "valid_spearman_last": float(valid_spearman_last),
+            "timestamp": datetime.now().isoformat()
+        }
+        with open(os.path.join(output_dir, "training_log.jsonl"), "a") as f:
+            f.write(json.dumps(log_entry) + "\n")
+
+    ## Q and A
+    print(f"Fold {fold}: Training Q and A")
+    model = Model().to(device) # Reset model? The notebook does this.
+    
+    optimizer_grouped_parameters = [
+        {
+            "params": [p for n, p in model.named_parameters() if p.requires_grad and not any(nd in n for nd in no_decay) and "bert" in n],
+            "weight_decay": config.weight_decay,
+            "lr": config.lr_bert
+        },
+        {
+            "params": [p for n, p in model.named_parameters() if  p.requires_grad and any(nd in n for nd in no_decay) and "bert" in n], 
+            "weight_decay": 0.0,
+            "lr": config.lr_bert
+        },
+        {
+            "params": [p for n, p in model.named_parameters() if p.requires_grad and "bert" not in n],
+            "weight_decay": config.weight_decay,
+            "lr": config.lr_head
+        }
+    ]
+    optimizer = AdamW(optimizer_grouped_parameters)
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer, num_warmup_steps=int(len(dataloader) * (config.epochs) * 0.05),
+        num_training_steps=len(dataloader) * (config.epochs)
+    )
+
+    for epoch in range(config.epochs): 
+        start = time.time()
+        model.train()
+        train_losses = []
+        train_preds = []
+        train_targets = []
+        for input_ids, token_type_ids, attention_mask, targets in tqdm(dataloader, total=len(dataloader), desc=f"Epoch {epoch+1}/{config.epochs}"):
+            input_ids = input_ids.to(device)
+            token_type_ids = token_type_ids.to(device)
+            attention_mask = attention_mask.to(device)
+            targets = targets.to(device)
+            outputs = model(input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
+            train_preds.extend(outputs.detach().sigmoid().cpu().numpy())
+            train_targets.extend(targets.detach().cpu().numpy())
+            loss = compute_loss(outputs, targets, label_weights)
+            model.zero_grad()
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+            train_losses.append(loss.detach().cpu().item())
+        
+        model.eval()
+        valid_losses = []
+        valid_preds = []
+        valid_targets = []
+        with torch.no_grad():
+            for input_ids, token_type_ids, attention_mask, targets in valid_dataloader:
+                input_ids = input_ids.to(device)
+                token_type_ids = token_type_ids.to(device)
+                attention_mask = attention_mask.to(device)
+                targets = targets.to(device)
+                outputs = model(input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
+                valid_preds.extend(outputs.sigmoid().cpu().numpy())
+                valid_targets.extend(targets.cpu().numpy())
+                loss = compute_loss(outputs, targets, label_weights)
+                valid_losses.append(loss.detach().cpu().item())
+            
+            valid_predictions.append(np.stack(valid_preds))
+            
+            test_preds = []
+            for input_ids, token_type_ids, attention_mask in test_dataloader:
+                input_ids = input_ids.to(device)
+                token_type_ids = token_type_ids.to(device)
+                attention_mask = attention_mask.to(device)
+                outputs = model(input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
+                test_preds.extend(outputs.sigmoid().cpu().numpy())
+            test_predictions.append(np.stack(test_preds))
+
+        print("Epoch {}: Train Loss {}, Valid Loss {}".format(epoch + 1, np.mean(train_losses), np.mean(valid_losses)))
+        train_spearman = compute_spearmanr(np.stack(train_targets), np.stack(train_preds))
+        valid_spearman_avg = compute_spearmanr(np.stack(valid_targets), sum(valid_predictions) / len(valid_predictions))
+        valid_spearman_last = compute_spearmanr(np.stack(valid_targets), valid_predictions[-1])
+
+        print("\t Train Spearmanr {:.4f}, Valid Spearmanr (avg) {:.4f}, Valid Spearmanr (last) {:.4f}".format(
+            train_spearman, valid_spearman_avg, valid_spearman_last
+        ))
+        print("\t elapsed: {}s".format(time.time() - start))
+
+        # Save model and logs
+        torch.save(model.state_dict(), os.path.join(output_dir, f"qa_model_fold{fold}_epoch{epoch}.bin"))
+        log_entry = {
+            "fold": fold,
+            "phase": "qa",
+            "epoch": epoch,
+            "train_loss": float(np.mean(train_losses)),
+            "valid_loss": float(np.mean(valid_losses)),
+            "train_spearman": float(train_spearman),
+            "valid_spearman_avg": float(valid_spearman_avg),
+            "valid_spearman_last": float(valid_spearman_last),
+            "timestamp": datetime.now().isoformat()
+        }
+        with open(os.path.join(output_dir, "training_log.jsonl"), "a") as f:
+            f.write(json.dumps(log_entry) + "\n")
+
+    return valid_predictions, test_predictions
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_dir", type=str, default=Config.data_dir, help="Directory containing train.csv and test.csv")
+    parser.add_argument("--output_dir", type=str, default=Config.output_dir, help="Directory to save submission")
+    parser.add_argument("--local_eval", action="store_true", help="Run in local evaluation mode (split train into train/test)")
+    parser.add_argument("--epochs", type=int, default=Config.epochs, help="Number of epochs for Q&A training")
+    parser.add_argument("--q_epochs", type=int, default=Config.q_epochs, help="Number of epochs for Question-only training")
+    args = parser.parse_args()
+
+    # Update Config with args
+    Config.data_dir = args.data_dir
+    Config.output_dir = args.output_dir
+    Config.local_eval = args.local_eval
+    Config.epochs = args.epochs
+    Config.q_epochs = args.q_epochs
+
+    seed_everything()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # Setup Output Directory
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    Config.output_dir = os.path.join(Config.output_dir, timestamp)
+    os.makedirs(Config.output_dir, exist_ok=True)
+    
+    # Save configuration
+    save_config(Config, Config.output_dir)
+    
+    print("\n" + "="*60)
+    print("CONFIGURATION")
+    print("="*60)
+    print(f"Model Name:        {Config.model_name}")
+    print(f"Max Seq Length:    {Config.max_sequence_length}")
+    print(f"Epochs (Q):        {Config.q_epochs}")
+    print(f"Epochs (Q&A):      {Config.epochs}")
+    print(f"Batch Size:        {Config.batch_size}")
+    print(f"N Splits (CV):     {Config.n_splits}")
+    print(f"Learning Rate:")
+    print(f"  - BERT:          {Config.lr_bert}")
+    print(f"  - Head:          {Config.lr_head}")
+    print(f"Weight Decay:      {Config.weight_decay}")
+    print(f"Seed:              {Config.seed}")
+    print(f"Local Eval:        {Config.local_eval}")
+    print(f"Output Directory:  {Config.output_dir}")
+    print("="*60 + "\n")
+
+    # Load Data
+    df_train = pd.read_csv(os.path.join(Config.data_dir, Config.train_csv))
+    
+    if Config.local_eval:
+        print("LOCAL EVAL MODE: Splitting train.csv into train and local_test")
+        # Split train into train and holdout
+        df_train, df_test = train_test_split(df_train, test_size=Config.test_size, random_state=42)
+        df_train = df_train.reset_index(drop=True)
+        df_test = df_test.reset_index(drop=True)
+        print(f"Train shape: {df_train.shape}, Local Test shape: {df_test.shape}")
+        # Save local test targets for evaluation
+        local_test_targets = df_test[list(df_train.columns[11:])].values
+    else:
+        df_test = pd.read_csv(os.path.join(Config.data_dir, Config.test_csv))
+    
+    output_categories = list(df_train.columns[11:])
+    
+    # Tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(Config.model_name)
+
+    # Compute Inputs
+    print("Computing input arrays...")
+    outputs = torch.tensor(compute_output_arrays(df_train, output_categories), dtype=torch.float)
+    inputs = [torch.tensor(x, dtype=torch.long) for x in compute_input_arrays(df_train, tokenizer, Config.max_sequence_length)]
+    question_only_inputs = [torch.tensor(x, dtype=torch.long) for x in compute_input_arrays(df_train, tokenizer, Config.max_sequence_length, question_only=True)]
+    test_inputs = [torch.tensor(x, dtype=torch.long) for x in compute_input_arrays(df_test, tokenizer, Config.max_sequence_length)]
+    test_question_only_inputs = [torch.tensor(x, dtype=torch.long) for x in compute_input_arrays(df_test, tokenizer, Config.max_sequence_length, question_only=True)]
+
+    # Label Weights
+    LABEL_WEIGHTS = torch.tensor(1.0 / df_train[output_categories].std().values, dtype=torch.float32).to(device)
+    LABEL_WEIGHTS = LABEL_WEIGHTS / LABEL_WEIGHTS.sum() * 30
+
+    # KFold
+    # kf = KFold(n_splits=Config.n_splits, shuffle=True, random_state=71)
+    # fold_ids = list(kf.split(df_train)) # Using simple KFold for simplicity, notebook used GroupKFold on URL but KFold is fine for general purpose
+    
+    # GroupKFold (Matching Notebook)
+    gkf = Fold(n_splits=Config.n_splits, shuffle=True, random_state=71)
+    fold_ids = gkf.get_groupkfold(df_train, group_name="url")
+
+    histories = []
+    test_dataset = TensorDataset(*test_inputs)
+    q_test_dataset = TensorDataset(*test_question_only_inputs)
+
+    for fold, (train_idx, valid_idx) in enumerate(fold_ids):
+        print(f"Starting Fold {fold+1}/{Config.n_splits}")
+        
+        train_inputs_fold = [inputs[i][train_idx] for i in range(3)]
+        q_train_inputs_fold = [question_only_inputs[i][train_idx] for i in range(3)]
+        train_outputs_fold = outputs[train_idx]
+        train_dataset = TensorDataset(*train_inputs_fold, train_outputs_fold)
+        q_train_dataset = TensorDataset(*q_train_inputs_fold, train_outputs_fold)
+
+        valid_inputs_fold = [inputs[i][valid_idx] for i in range(3)]
+        q_valid_inputs_fold = [question_only_inputs[i][valid_idx] for i in range(3)]
+        valid_outputs_fold = outputs[valid_idx]
+        valid_dataset = TensorDataset(*valid_inputs_fold, valid_outputs_fold)
+        q_valid_dataset = TensorDataset(*q_valid_inputs_fold, valid_outputs_fold)
+
+        history = train_and_predict(
+            train_data=train_dataset, 
+            valid_data=valid_dataset,
+            test_data=test_dataset, 
+            q_train_data=q_train_dataset, 
+            q_valid_data=q_valid_dataset,
+            q_test_data=q_test_dataset, 
+            fold=fold,
+            device=device, label_weights=LABEL_WEIGHTS, output_dir=Config.output_dir, config=Config
+        )
+        histories.append(history)
+
+    # Post-processing (Averaging)
+    # The notebook does LightGBM stacking, but for the script, let's first implement simple averaging as a baseline
+    # and then if needed we can add LightGBM. The prompt asked to implement based on the notebook, so I should probably include LightGBM.
+    # However, LightGBM part is quite complex to set up in a single script without saving intermediate OOFs.
+    # Let's stick to the notebook logic:
+    
+    # 1. Get val preds per each epoch
+    n_epochs_total = len(histories[0][0]) # q_epochs + epochs (actually the notebook returns list of lists)
+    # Wait, the notebook returns `valid_predictions` which is a list of preds for each epoch.
+    # In `train_and_predict` I append to `valid_predictions` in both loops.
+    # So `histories[fold][0]` is a list of arrays, one for each epoch.
+    
+    val_preds_list = []
+    for epoch in range(n_epochs_total):
+        val_preds_one_epoch = np.zeros([len(df_train), 30])
+        for fold, (train_idx, valid_idx) in enumerate(fold_ids):
+            val_pred = histories[fold][0][epoch]
+            val_preds_one_epoch[valid_idx, :] += val_pred
+        val_preds_list.append(val_preds_one_epoch)
+
+    oof_predictions = np.zeros((n_epochs_total, len(df_train), len(output_categories)), dtype=np.float32)
+    for j, name in enumerate(output_categories):
+        for epoch in range(n_epochs_total):
+            oof_predictions[epoch, :, j] = val_preds_list[epoch][:, j]
+
+    # 2. Get test preds per each epoch
+    test_preds_list = []
+    for epoch in range(n_epochs_total):
+        test_preds_one_epoch = 0
+        for fold in range(len(fold_ids)):
+            test_preds = histories[fold][1][epoch]
+            test_preds_one_epoch += test_preds
+        test_preds_one_epoch = test_preds_one_epoch / len(fold_ids)
+        test_preds_list.append(test_preds_one_epoch)
+
+    test_predictions = np.zeros((n_epochs_total, len(df_test), len(output_categories)), dtype=np.float32)
+    for j, name in enumerate(output_categories):
+        for epoch in range(n_epochs_total):
+            test_predictions[epoch, :, j] = test_preds_list[epoch][:, j]
+
+    # LightGBM Stacking
+    print("Training LightGBM Stacking...")
+    sub = pd.read_csv(os.path.join(Config.data_dir, Config.sub_csv))
+        
+    final_test_preds = []
+    
+    # Simple LightGBM wrapper
+    lgb_params = {
+        "boosting_type": "gbdt",
+        "objective": "rmse",
+        "learning_rate": 0.1,
+        "max_depth": 1,
+        "seed": 71,
+        "verbose": -1
+    }
+    
+    for i_col, col_name in enumerate(output_categories):
+        y_train = compute_output_arrays(df_train, output_categories)[:, i_col]
+        
+        # Features: predictions from all epochs for this column
+        # shape: (n_samples, n_epochs)
+        x_train = oof_predictions[:, :, i_col].T 
+        x_test = test_predictions[:, :, i_col].T
+        
+        # Notebook actually concatenates ALL columns from ALL epochs?
+        # Notebook: x_train = pd.DataFrame(np.concatenate([oof_predictions[:, :, i].T for i in range(30)], axis=1))
+        # This means for each target column, it uses predictions of ALL target columns from ALL epochs as features.
+        # That's huge. Let's double check the notebook.
+        # "x_train = pd.DataFrame(np.concatenate([oof_predictions[:, :, i].T for i in range(30)], axis=1))"
+        # Yes, it concatenates everything.
+        
+        x_train_all = np.concatenate([oof_predictions[:, :, k].T for k in range(30)], axis=1)
+        x_test_all = np.concatenate([test_predictions[:, :, k].T for k in range(30)], axis=1)
+        
+        # Train LightGBM
+        # We need another CV here? Notebook uses `model.cv` which does CV internally.
+        # To keep it simple and fast for the script, let's just train on full data and predict on test
+        # OR replicate the CV logic if we want to be exact.
+        # Notebook uses `fold_ids` for CV in LightGBM.
+        
+        test_preds_col = np.zeros(len(df_test))
+        
+        # CV for LightGBM
+        for trn_idx, val_idx in fold_ids:
+            x_trn_fold = x_train_all[trn_idx]
+            y_trn_fold = y_train[trn_idx]
+            x_val_fold = x_train_all[val_idx]
+            y_val_fold = y_train[val_idx]
+            
+            d_train = lgb.Dataset(x_trn_fold, label=y_trn_fold)
+            d_valid = lgb.Dataset(x_val_fold, label=y_val_fold)
+            
+            model = lgb.train(lgb_params, d_train, num_boost_round=5000, 
+                              valid_sets=[d_valid], 
+                              callbacks=[lgb.early_stopping(stopping_rounds=20)])
+            
+            test_preds_col += model.predict(x_test_all) / len(fold_ids)
+            
+        final_test_preds.append(test_preds_col)
+        print(f"Finished LightGBM for {col_name}")
+
+    if Config.local_eval:
+        sub = pd.DataFrame(columns=['qa_id'] + output_categories)
+        sub['qa_id'] = df_test['qa_id']
+        sub.iloc[:, 1:] = np.array(final_test_preds).T
+    else:
+        sub.iloc[:, 1:] = np.array(final_test_preds).T
+    
+    if Config.local_eval:
+        print("\n" + "="*30)
+        print("LOCAL EVALUATION RESULTS")
+        print("="*30)
+        local_score = compute_spearmanr(local_test_targets, sub.iloc[:, 1:].values)
+        print(f"Simulated Public LB Score (Spearman): {local_score:.5f}")
+        print("="*30 + "\n")
+        sub.to_csv(os.path.join(Config.output_dir, "local_submission.csv"), index=False)
+        print("Local submission saved to local_submission.csv")
+        
+        # Save final summary
+        summary = {
+            "local_spearman_score": float(local_score),
+            "n_folds": Config.n_splits,
+            "total_epochs_per_fold": Config.q_epochs + Config.epochs,
+            "training_complete": True,
+            "completed_at": datetime.now().isoformat()
+        }
+    else:
+        sub.to_csv(os.path.join(Config.output_dir, "submission.csv"), index=False)
+        print("Submission saved to submission.csv")
+        
+        # Save final summary
+        summary = {
+            "n_folds": Config.n_splits,
+            "total_epochs_per_fold": Config.q_epochs + Config.epochs,
+            "training_complete": True,
+            "completed_at": datetime.now().isoformat()
+        }
+    
+    with open(os.path.join(Config.output_dir, "summary.json"), "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"\nSummary saved to {os.path.join(Config.output_dir, 'summary.json')}")
+
+if __name__ == "__main__":
+    main()
