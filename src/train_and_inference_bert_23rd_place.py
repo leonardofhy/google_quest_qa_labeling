@@ -27,11 +27,11 @@ warnings.filterwarnings("ignore")
 
 class Config:
     seed = 1234
-    model_name = "bert-base-uncased"
+    model_name = "google-bert/bert-base-uncased"
     max_sequence_length = 512
     epochs = 3
     q_epochs = 3
-    batch_size = 8
+    batch_size = 256 
     n_splits = 5
     
     # Optimizer
@@ -150,6 +150,12 @@ class Model(nn.Module):
         config = AutoConfig.from_pretrained(model_name)
         config.output_hidden_states = True
         self.bert = AutoModel.from_pretrained(model_name, config=config)
+        self.config = config
+        
+        # Get sep_token_id from tokenizer (not from model config)
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.sep_token_id = tokenizer.sep_token_id
+        
         self.cls_token_head = nn.Sequential(
             nn.Dropout(0.1),
             nn.Linear(config.hidden_size * 4, config.hidden_size),
@@ -166,9 +172,17 @@ class Model(nn.Module):
         )
         
     def forward(self, input_ids, attention_mask, token_type_ids):
-        question_answer_seps = (torch.sum((token_type_ids == 0) * attention_mask, -1) - 1)
+        # Find the index of the first [SEP] token
+        # input_ids: [CLS] Title + Question [SEP] Answer [SEP]
+        # We want the first [SEP] to separate Question and Answer
+        mask = (input_ids == self.sep_token_id)
+        question_answer_seps = mask.to(torch.long).argmax(dim=-1)
         
-        outputs = self.bert(input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
+        # DeBERTa v3 doesn't use token_type_ids, check if model supports it
+        if hasattr(self.config, 'type_vocab_size') and self.config.type_vocab_size > 0:
+            outputs = self.bert(input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
+        else:
+            outputs = self.bert(input_ids, attention_mask=attention_mask)
         hidden_states = outputs.hidden_states
         
         hidden_states_cls_embeddings = [x[:, 0] for x in hidden_states[-4:]]
@@ -217,6 +231,29 @@ def compute_spearmanr(trues, preds):
             col_pred[np.random.randint(0, len(col_pred) - 1)] = col_pred.max() + 1
         rhos.append(spearmanr(col_trues, col_pred).correlation)
     return np.mean(rhos)
+
+def save_config(config, output_dir):
+    """Save configuration to JSON file"""
+    config_dict = {
+        "seed": config.seed,
+        "model_name": config.model_name,
+        "max_sequence_length": config.max_sequence_length,
+        "epochs": config.epochs,
+        "q_epochs": config.q_epochs,
+        "batch_size": config.batch_size,
+        "n_splits": config.n_splits,
+        "lr_bert": config.lr_bert,
+        "lr_head": config.lr_head,
+        "weight_decay": config.weight_decay,
+        "data_dir": config.data_dir,
+        "output_dir": config.output_dir,
+        "local_eval": config.local_eval,
+        "test_size": config.test_size,
+        "timestamp": datetime.now().isoformat()
+    }
+    with open(os.path.join(output_dir, "config.json"), "w") as f:
+        json.dump(config_dict, f, indent=2)
+    print(f"Configuration saved to {os.path.join(output_dir, 'config.json')}")
 
 def train_and_predict(train_data, valid_data, test_data, q_train_data, q_valid_data, q_test_data, 
                       fold, device, label_weights, output_dir, config):
@@ -461,9 +498,29 @@ def main():
 
     # Setup Output Directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    Config.output_dir = os.path.join(Config.output_dir, f"bert_23rd_place_{timestamp}")
+    Config.output_dir = os.path.join(Config.output_dir, timestamp)
     os.makedirs(Config.output_dir, exist_ok=True)
-    print(f"Output directory: {Config.output_dir}")
+    
+    # Save configuration
+    save_config(Config, Config.output_dir)
+    
+    print("\n" + "="*60)
+    print("CONFIGURATION")
+    print("="*60)
+    print(f"Model Name:        {Config.model_name}")
+    print(f"Max Seq Length:    {Config.max_sequence_length}")
+    print(f"Epochs (Q):        {Config.q_epochs}")
+    print(f"Epochs (Q&A):      {Config.epochs}")
+    print(f"Batch Size:        {Config.batch_size}")
+    print(f"N Splits (CV):     {Config.n_splits}")
+    print(f"Learning Rate:")
+    print(f"  - BERT:          {Config.lr_bert}")
+    print(f"  - Head:          {Config.lr_head}")
+    print(f"Weight Decay:      {Config.weight_decay}")
+    print(f"Seed:              {Config.seed}")
+    print(f"Local Eval:        {Config.local_eval}")
+    print(f"Output Directory:  {Config.output_dir}")
+    print("="*60 + "\n")
 
     # Load Data
     df_train = pd.read_csv(os.path.join(Config.data_dir, Config.train_csv))
@@ -637,8 +694,12 @@ def main():
         final_test_preds.append(test_preds_col)
         print(f"Finished LightGBM for {col_name}")
 
-    sub.iloc[:, 1:] = np.array(final_test_preds).T
-    sub.iloc[:, 1:] = np.array(final_test_preds).T
+    if Config.local_eval:
+        sub = pd.DataFrame(columns=['qa_id'] + output_categories)
+        sub['qa_id'] = df_test['qa_id']
+        sub.iloc[:, 1:] = np.array(final_test_preds).T
+    else:
+        sub.iloc[:, 1:] = np.array(final_test_preds).T
     
     if Config.local_eval:
         print("\n" + "="*30)
@@ -649,9 +710,30 @@ def main():
         print("="*30 + "\n")
         sub.to_csv(os.path.join(Config.output_dir, "local_submission.csv"), index=False)
         print("Local submission saved to local_submission.csv")
+        
+        # Save final summary
+        summary = {
+            "local_spearman_score": float(local_score),
+            "n_folds": Config.n_splits,
+            "total_epochs_per_fold": Config.q_epochs + Config.epochs,
+            "training_complete": True,
+            "completed_at": datetime.now().isoformat()
+        }
     else:
         sub.to_csv(os.path.join(Config.output_dir, "submission.csv"), index=False)
         print("Submission saved to submission.csv")
+        
+        # Save final summary
+        summary = {
+            "n_folds": Config.n_splits,
+            "total_epochs_per_fold": Config.q_epochs + Config.epochs,
+            "training_complete": True,
+            "completed_at": datetime.now().isoformat()
+        }
+    
+    with open(os.path.join(Config.output_dir, "summary.json"), "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"\nSummary saved to {os.path.join(Config.output_dir, 'summary.json')}")
 
 if __name__ == "__main__":
     main()
