@@ -28,10 +28,10 @@ warnings.filterwarnings("ignore")
 class Config:
     seed = 42
     model_name = "microsoft/deberta-v3-base"
-    max_sequence_length = 512
+    max_sequence_length = 1024
     epochs = 3
     q_epochs = 3
-    batch_size = 8 
+    batch_size = 8
     n_splits = 5
     
     # Optimizer
@@ -66,20 +66,109 @@ def _convert_to_transformer_inputs(title: str, question: str, answer: str, token
     question = _preprocess_text(str(question))
     answer = _preprocess_text(str(answer))
     
-    text_a = f"{title} {question}"
-    text_b = answer if not question_only else None
+    # 1. Tokenize separately
+    title_tokens = tokenizer.tokenize(title)
+    question_tokens = tokenizer.tokenize(question)
+    answer_tokens = tokenizer.tokenize(answer)
     
-    inputs = tokenizer.encode_plus(
-        text_a,
-        text_b,
-        add_special_tokens=True,
-        max_length=max_sequence_length,
-        padding="max_length",
-        truncation=True,
-        return_token_type_ids=True
-    )
+    # 2. Define special tokens
+    cls_token = tokenizer.cls_token
+    sep_token = tokenizer.sep_token
+    pad_token_id = tokenizer.pad_token_id
     
-    return inputs["input_ids"], inputs["token_type_ids"], inputs["attention_mask"]
+    # 3. Calculate budget
+    # Format: [CLS] Title Question [SEP] Answer [SEP]
+    # Special tokens count: 3 ([CLS], [SEP], [SEP])
+    special_tokens_count = 3
+    available_length = max_sequence_length - special_tokens_count - len(title_tokens)
+    
+    # If title is too long (unlikely but possible), truncate it
+    if available_length < 0:
+        title_tokens = title_tokens[:max_sequence_length - special_tokens_count]
+        available_length = 0
+        question_tokens = []
+        answer_tokens = []
+    
+    if question_only:
+        # If question only, give all budget to question
+        if len(question_tokens) > available_length:
+            # Head+Tail Truncation for Question
+            head_len = available_length // 2
+            tail_len = available_length - head_len
+            question_tokens = question_tokens[:head_len] + question_tokens[-tail_len:]
+        answer_tokens = []
+    else:
+        # Distribute budget between Question and Answer
+        # Strategy: Try to keep them balanced, or give more to Answer?
+        # Baseline strategy: trim both if needed.
+        # Let's assume 50/50 split if both are long
+        
+        # First, check if total fits
+        if len(question_tokens) + len(answer_tokens) > available_length:
+            # We need to trim.
+            # Simple strategy: Alloc half to Q, half to A.
+            # If one is short, give the rest to the other.
+            
+            q_len = len(question_tokens)
+            a_len = len(answer_tokens)
+            
+            if q_len + a_len > available_length:
+                # Calculate target lengths
+                target_q_len = available_length // 2
+                target_a_len = available_length - target_q_len
+                
+                # Adjust if one is shorter than target
+                if q_len < target_q_len:
+                    target_a_len += (target_q_len - q_len)
+                    target_q_len = q_len
+                elif a_len < target_a_len:
+                    target_q_len += (target_a_len - a_len)
+                    target_a_len = a_len
+                
+                # Apply Head+Tail Truncation
+                if len(question_tokens) > target_q_len:
+                    head = target_q_len // 2
+                    tail = target_q_len - head
+                    question_tokens = question_tokens[:head] + question_tokens[-tail:]
+                    
+                if len(answer_tokens) > target_a_len:
+                    head = target_a_len // 2
+                    tail = target_a_len - head
+                    answer_tokens = answer_tokens[:head] + answer_tokens[-tail:]
+
+    # 4. Construct Input IDs
+    # [CLS] Title + Question [SEP] Answer [SEP]
+    tokens = [cls_token] + title_tokens + question_tokens + [sep_token]
+    if not question_only:
+        tokens += answer_tokens + [sep_token]
+    else:
+        # Even for question only, we usually append a SEP at the end
+        # But wait, if question_only, we just want [CLS] Title Question [SEP]
+        pass
+
+    input_ids = tokenizer.convert_tokens_to_ids(tokens)
+    
+    # 5. Padding
+    if len(input_ids) < max_sequence_length:
+        padding_length = max_sequence_length - len(input_ids)
+        input_ids = input_ids + [pad_token_id] * padding_length
+        
+    # 6. Attention Mask
+    # 1 for tokens, 0 for padding
+    attention_mask = [1] * len(tokens) + [0] * (max_sequence_length - len(tokens))
+    
+    # 7. Token Type IDs
+    # DeBERTa v3 doesn't strictly need them, but we can generate them.
+    # 0 for [CLS] Title Question [SEP]
+    # 1 for Answer [SEP]
+    # 0 for Padding
+    
+    len_q = 1 + len(title_tokens) + len(question_tokens) + 1 # [CLS] ... [SEP]
+    len_a = len(answer_tokens) + 1 if not question_only else 0 # ... [SEP]
+    
+    token_type_ids = [0] * len_q + [1] * len_a + [0] * (max_sequence_length - len_q - len_a)
+    
+    return input_ids, token_type_ids, attention_mask
 
 def compute_input_arrays(df, tokenizer, max_sequence_length, question_only=False):
     input_ids, input_token_type_ids, input_attention_masks = [], [], []
@@ -124,6 +213,20 @@ class Fold(object):
 
         return folds_ids
 
+class WeightedLayerPooling(nn.Module):
+    def __init__(self, num_hidden_layers, layer_start: int = 4, layer_weights = None):
+        super(WeightedLayerPooling, self).__init__()
+        self.layer_start = layer_start
+        self.num_hidden_layers = num_hidden_layers
+        self.layer_weights = layer_weights if layer_weights is not None \
+            else nn.Parameter(torch.tensor([1] * (num_hidden_layers+1 - layer_start), dtype=torch.float))
+
+    def forward(self, all_hidden_states):
+        all_layer_embedding = all_hidden_states[self.layer_start:]
+        weight_factor = self.layer_weights.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).expand(all_layer_embedding.size())
+        weighted_average = (weight_factor*all_layer_embedding).sum(dim=0) / self.layer_weights.sum()
+        return weighted_average
+
 class Model(nn.Module):
     def __init__(self, model_name=Config.model_name):
         super().__init__()
@@ -132,26 +235,195 @@ class Model(nn.Module):
         self.bert = AutoModel.from_pretrained(model_name, config=config)
         self.config = config
         
-        # Simple Mean Pooling Head
-        self.linear = nn.Sequential(
-            nn.Dropout(0.1),
-            nn.Linear(config.hidden_size, 30),
+        # Weighted Layer Pooling: Use last 4 layers
+        self.pooler = WeightedLayerPooling(
+            num_hidden_layers=config.num_hidden_layers, 
+            layer_start=config.num_hidden_layers - 4,
+            layer_weights=None
         )
+        
+        # Multi-Sample Dropout
+        self.dropouts = nn.ModuleList([nn.Dropout(0.1) for _ in range(5)])
+        self.linear = nn.Linear(config.hidden_size, 30)
         
     def forward(self, input_ids, attention_mask, token_type_ids):
         # DeBERTa v3 handles token_type_ids automatically if passed, but for safety we can pass them.
         outputs = self.bert(input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
         
-        # Mean Pooling
-        last_hidden_state = outputs.last_hidden_state # [batch, seq_len, hidden]
-        input_mask_expanded = attention_mask.unsqueeze(-1).expand(last_hidden_state.size()).float()
-        sum_embeddings = torch.sum(last_hidden_state * input_mask_expanded, 1)
+        # Weighted Layer Pooling
+        all_hidden_states = torch.stack(outputs.hidden_states)
+        weighted_pooling_embeddings = self.pooler(all_hidden_states)
+        
+        # Mean Pooling on the weighted embeddings
+        input_mask_expanded = attention_mask.unsqueeze(-1).expand(weighted_pooling_embeddings.size()).float()
+        sum_embeddings = torch.sum(weighted_pooling_embeddings * input_mask_expanded, 1)
         sum_mask = input_mask_expanded.sum(1)
         sum_mask = torch.clamp(sum_mask, min=1e-9)
         mean_embeddings = sum_embeddings / sum_mask
         
-        x = self.linear(mean_embeddings)
+        # Multi-Sample Dropout
+        for i, dropout in enumerate(self.dropouts):
+            if i == 0:
+                x = self.linear(dropout(mean_embeddings))
+            else:
+                x += self.linear(dropout(mean_embeddings))
+        
+        x = x / len(self.dropouts)
         return x
+
+class AWP:
+    def __init__(
+        self,
+        model,
+        optimizer,
+        adv_param="weight",
+        adv_lr=1,
+        adv_eps=0.2,
+        start_epoch=0,
+        adv_step=1,
+        scaler=None
+    ):
+        self.model = model
+        self.optimizer = optimizer
+        self.adv_param = adv_param
+        self.adv_lr = adv_lr
+        self.adv_eps = adv_eps
+        self.start_epoch = start_epoch
+        self.adv_step = adv_step
+        self.backup = {}
+        self.backup_eps = {}
+        self.scaler = scaler
+
+    def attack_backward(self, inputs, labels, label_weights, epoch):
+        if (self.adv_lr == 0) or (epoch < self.start_epoch):
+            return None
+
+        self._save() 
+        for i in range(self.adv_step):
+            self._attack_step() 
+            with torch.cuda.amp.autocast():
+                # Re-run forward pass with perturbed weights
+                # Note: We need to unpack inputs here just like in the main loop
+                input_ids, token_type_ids, attention_mask = inputs
+                outputs = self.model(input_ids, attention_mask, token_type_ids)
+                adv_loss = compute_loss(outputs, labels, label_weights)
+            
+            self.optimizer.zero_grad()
+            if self.scaler:
+                self.scaler.scale(adv_loss).backward()
+            else:
+                adv_loss.backward()
+            
+        self._restore()
+
+    def _attack_step(self):
+        e = 1e-6
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and param.grad is not None and self.adv_param in name:
+                norm1 = torch.norm(param.grad)
+                norm2 = torch.norm(param.data.detach())
+                if norm1 != 0 and not torch.isnan(norm1):
+                    r_at = self.adv_lr * param.grad / (norm1 + e) * (norm2 + e)
+                    param.data.add_(r_at)
+                    param.data = torch.min(
+                        torch.max(param.data, self.backup_eps[name][0]), self.backup_eps[name][1]
+                    )
+                # param.data.clamp_(*self.backup_eps[name])
+
+    def _save(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and param.grad is not None and self.adv_param in name:
+                if name not in self.backup:
+                    self.backup[name] = param.data.clone()
+                    grad_eps = self.adv_eps * param.abs().detach()
+                    self.backup_eps[name] = (
+                        self.backup[name] - grad_eps,
+                        self.backup[name] + grad_eps,
+                    )
+
+    def _restore(self):
+        for name, param in self.model.named_parameters():
+            if name in self.backup:
+                param.data = self.backup[name]
+        self.backup = {}
+        self.backup_eps = {}
+
+class AWP:
+    def __init__(
+        self,
+        model,
+        optimizer,
+        adv_param="weight",
+        adv_lr=1,
+        adv_eps=0.2,
+        start_epoch=0,
+        adv_step=1,
+        scaler=None
+    ):
+        self.model = model
+        self.optimizer = optimizer
+        self.adv_param = adv_param
+        self.adv_lr = adv_lr
+        self.adv_eps = adv_eps
+        self.start_epoch = start_epoch
+        self.adv_step = adv_step
+        self.backup = {}
+        self.backup_eps = {}
+        self.scaler = scaler
+
+    def attack_backward(self, inputs, labels, label_weights, epoch):
+        if (self.adv_lr == 0) or (epoch < self.start_epoch):
+            return None
+
+        self._save() 
+        for i in range(self.adv_step):
+            self._attack_step() 
+            with torch.cuda.amp.autocast():
+                # Re-run forward pass with perturbed weights
+                # Note: We need to unpack inputs here just like in the main loop
+                input_ids, token_type_ids, attention_mask = inputs
+                outputs = self.model(input_ids, attention_mask, token_type_ids)
+                adv_loss = compute_loss(outputs, labels, label_weights)
+            
+            self.optimizer.zero_grad()
+            if self.scaler:
+                self.scaler.scale(adv_loss).backward()
+            else:
+                adv_loss.backward()
+            
+        self._restore()
+
+    def _attack_step(self):
+        e = 1e-6
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and param.grad is not None and self.adv_param in name:
+                norm1 = torch.norm(param.grad)
+                norm2 = torch.norm(param.data.detach())
+                if norm1 != 0 and not torch.isnan(norm1):
+                    r_at = self.adv_lr * param.grad / (norm1 + e) * (norm2 + e)
+                    param.data.add_(r_at)
+                    param.data = torch.min(
+                        torch.max(param.data, self.backup_eps[name][0]), self.backup_eps[name][1]
+                    )
+                # param.data.clamp_(*self.backup_eps[name])
+
+    def _save(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and param.grad is not None and self.adv_param in name:
+                if name not in self.backup:
+                    self.backup[name] = param.data.clone()
+                    grad_eps = self.adv_eps * param.abs().detach()
+                    self.backup_eps[name] = (
+                        self.backup[name] - grad_eps,
+                        self.backup[name] + grad_eps,
+                    )
+
+    def _restore(self):
+        for name, param in self.model.named_parameters():
+            if name in self.backup:
+                param.data = self.backup[name]
+        self.backup = {}
+        self.backup_eps = {}
 
 def compute_loss(outputs, targets, label_weights, alpha=0.5, margin=0.1, question_only=False):
     if question_only:
@@ -223,23 +495,59 @@ def train_and_predict(train_data, valid_data, test_data, q_train_data, q_valid_d
 
     # Prepare optimizer and schedule (linear warmup and decay)
     no_decay = ["bias", "LayerNorm.weight"]
-    optimizer_grouped_parameters = [
-        {
-            "params": [p for n, p in model.named_parameters() if p.requires_grad and not any(nd in n for nd in no_decay) and "bert" in n],
+    
+    # Layer-wise Learning Rate Decay (LLRD)
+    optimizer_grouped_parameters = []
+    
+    # 1. Head Parameters (Highest LR)
+    optimizer_grouped_parameters.append({
+        "params": [p for n, p in model.named_parameters() if "bert" not in n],
+        "weight_decay": config.weight_decay,
+        "lr": config.lr_head
+    })
+    
+    # 2. DeBERTa Layers (Decaying LR)
+    # DeBERTa v3 base has 12 layers. 
+    # Layer 11 (top) gets lr_bert, Layer 0 (bottom) gets lr_bert * (decay ** 11)
+    # Embeddings get lr_bert * (decay ** 12)
+    
+    layer_decay = 0.9
+    num_layers = model.config.num_hidden_layers
+    
+    # Embeddings
+    optimizer_grouped_parameters.append({
+        "params": [p for n, p in model.named_parameters() if "embeddings" in n],
+        "weight_decay": config.weight_decay,
+        "lr": config.lr_bert * (layer_decay ** num_layers)
+    })
+    
+    # Encoder Layers
+    for layer_i in range(num_layers):
+        # Capture parameters for this specific layer
+        # Note: DeBERTa layer naming is usually 'encoder.layer.0', 'encoder.layer.1', etc.
+        layer_params = [p for n, p in model.named_parameters() if f"encoder.layer.{layer_i}." in n]
+        
+        optimizer_grouped_parameters.append({
+            "params": layer_params,
+            "weight_decay": config.weight_decay,
+            "lr": config.lr_bert * (layer_decay ** (num_layers - 1 - layer_i))
+        })
+        
+    # Other parameters (Pooler, etc. if any, though we replaced pooler)
+    # Just in case we missed anything, give them base LR
+    existing_params = set()
+    for group in optimizer_grouped_parameters:
+        for p in group["params"]:
+            existing_params.add(p)
+            
+    remaining_params = [p for p in model.parameters() if p not in existing_params]
+    if remaining_params:
+        optimizer_grouped_parameters.append({
+            "params": remaining_params,
             "weight_decay": config.weight_decay,
             "lr": config.lr_bert
-        },
-        {
-            "params": [p for n, p in model.named_parameters() if  p.requires_grad and any(nd in n for nd in no_decay) and "bert" in n], 
-            "weight_decay": 0.0,
-            "lr": config.lr_bert
-        },
-        {
-            "params": [p for n, p in model.named_parameters() if p.requires_grad and "bert" not in n],
-            "weight_decay": config.weight_decay,
-            "lr": config.lr_head
-        }
-    ]
+        })
+
     optimizer = AdamW(optimizer_grouped_parameters)
     scheduler = get_linear_schedule_with_warmup(
         optimizer, num_warmup_steps=int(len(q_dataloader) * (config.q_epochs) * 0.05),
@@ -248,6 +556,12 @@ def train_and_predict(train_data, valid_data, test_data, q_train_data, q_valid_d
     
     test_predictions = []
     valid_predictions = []
+
+    scaler = torch.cuda.amp.GradScaler()
+    
+    # Initialize AWP
+    # Start AWP from epoch 1 (second epoch) to let model stabilize first
+    awp = AWP(model, optimizer, adv_lr=1e-4, adv_eps=1e-2, start_epoch=1, scaler=scaler)
 
     ## Question Only
     print(f"Fold {fold}: Training Question Only")
@@ -262,14 +576,27 @@ def train_and_predict(train_data, valid_data, test_data, q_train_data, q_valid_d
             token_type_ids = token_type_ids.to(device)
             attention_mask = attention_mask.to(device)
             targets = targets.to(device)
-            outputs = model(input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
+            
+            # Clear gradients at start of step
+            optimizer.zero_grad()
+            
+            with torch.cuda.amp.autocast():
+                outputs = model(input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
+                loss = compute_loss(outputs, targets, label_weights, question_only=True)
+            
+            scaler.scale(loss).backward()
+            
+            # AWP Attack
+            # We pass the raw inputs tuple to attack_backward
+            inputs = (input_ids, token_type_ids, attention_mask)
+            awp.attack_backward(inputs, targets, label_weights, epoch)
+            
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+            
             train_preds.extend(outputs.detach().sigmoid().cpu().numpy())
             train_targets.extend(targets.detach().cpu().numpy())
-            loss = compute_loss(outputs, targets, label_weights, question_only=True)
-            model.zero_grad()
-            loss.backward()
-            optimizer.step()
-            scheduler.step()
             train_losses.append(loss.detach().cpu().item())
         
         model.eval()
@@ -335,28 +662,59 @@ def train_and_predict(train_data, valid_data, test_data, q_train_data, q_valid_d
     print(f"Fold {fold}: Training Q and A")
     model = Model().to(device) # Reset model? The notebook does this.
     
-    optimizer_grouped_parameters = [
-        {
-            "params": [p for n, p in model.named_parameters() if p.requires_grad and not any(nd in n for nd in no_decay) and "bert" in n],
+    # Layer-wise Learning Rate Decay (LLRD) for Q&A Phase
+    optimizer_grouped_parameters = []
+    
+    # 1. Head Parameters (Highest LR)
+    optimizer_grouped_parameters.append({
+        "params": [p for n, p in model.named_parameters() if "bert" not in n],
+        "weight_decay": config.weight_decay,
+        "lr": config.lr_head
+    })
+    
+    # 2. DeBERTa Layers (Decaying LR)
+    layer_decay = 0.9
+    num_layers = model.config.num_hidden_layers
+    
+    # Embeddings
+    optimizer_grouped_parameters.append({
+        "params": [p for n, p in model.named_parameters() if "embeddings" in n],
+        "weight_decay": config.weight_decay,
+        "lr": config.lr_bert * (layer_decay ** num_layers)
+    })
+    
+    # Encoder Layers
+    for layer_i in range(num_layers):
+        layer_params = [p for n, p in model.named_parameters() if f"encoder.layer.{layer_i}." in n]
+        optimizer_grouped_parameters.append({
+            "params": layer_params,
+            "weight_decay": config.weight_decay,
+            "lr": config.lr_bert * (layer_decay ** (num_layers - 1 - layer_i))
+        })
+        
+    # Remaining
+    existing_params = set()
+    for group in optimizer_grouped_parameters:
+        for p in group["params"]:
+            existing_params.add(p)
+    remaining_params = [p for p in model.parameters() if p not in existing_params]
+    if remaining_params:
+        optimizer_grouped_parameters.append({
+            "params": remaining_params,
             "weight_decay": config.weight_decay,
             "lr": config.lr_bert
-        },
-        {
-            "params": [p for n, p in model.named_parameters() if  p.requires_grad and any(nd in n for nd in no_decay) and "bert" in n], 
-            "weight_decay": 0.0,
-            "lr": config.lr_bert
-        },
-        {
-            "params": [p for n, p in model.named_parameters() if p.requires_grad and "bert" not in n],
-            "weight_decay": config.weight_decay,
-            "lr": config.lr_head
-        }
-    ]
+        })
+
     optimizer = AdamW(optimizer_grouped_parameters)
     scheduler = get_linear_schedule_with_warmup(
         optimizer, num_warmup_steps=int(len(dataloader) * (config.epochs) * 0.05),
         num_training_steps=len(dataloader) * (config.epochs)
     )
+
+    scaler = torch.cuda.amp.GradScaler()
+    
+    # Initialize AWP for Q&A phase
+    awp = AWP(model, optimizer, adv_lr=1e-4, adv_eps=1e-2, start_epoch=1, scaler=scaler)
 
     for epoch in range(config.epochs): 
         start = time.time()
@@ -369,14 +727,25 @@ def train_and_predict(train_data, valid_data, test_data, q_train_data, q_valid_d
             token_type_ids = token_type_ids.to(device)
             attention_mask = attention_mask.to(device)
             targets = targets.to(device)
-            outputs = model(input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
+            
+            optimizer.zero_grad()
+            
+            with torch.cuda.amp.autocast():
+                outputs = model(input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
+                loss = compute_loss(outputs, targets, label_weights)
+            
+            scaler.scale(loss).backward()
+            
+            # AWP Attack
+            inputs = (input_ids, token_type_ids, attention_mask)
+            awp.attack_backward(inputs, targets, label_weights, epoch)
+            
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+            
             train_preds.extend(outputs.detach().sigmoid().cpu().numpy())
             train_targets.extend(targets.detach().cpu().numpy())
-            loss = compute_loss(outputs, targets, label_weights)
-            model.zero_grad()
-            loss.backward()
-            optimizer.step()
-            scheduler.step()
             train_losses.append(loss.detach().cpu().item())
         
         model.eval()
@@ -441,6 +810,7 @@ def main():
     parser.add_argument("--local_eval", action="store_true", help="Run in local evaluation mode (split train into train/test)")
     parser.add_argument("--epochs", type=int, default=Config.epochs, help="Number of epochs for Q&A training")
     parser.add_argument("--q_epochs", type=int, default=Config.q_epochs, help="Number of epochs for Question-only training")
+    parser.add_argument("--folds", type=int, default=Config.n_splits, help="Number of folds to run")
     args = parser.parse_args()
 
     # Update Config with args
@@ -449,19 +819,25 @@ def main():
     Config.local_eval = args.local_eval
     Config.epochs = args.epochs
     Config.q_epochs = args.q_epochs
+    
+    # We don't update Config.n_splits because that affects KFold splitting logic.
+    # We only control how many folds we iterate over.
+    run_folds = args.folds
+    Config.run_folds = run_folds # Save to Config for logging
 
     seed_everything()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-
+    
     # Setup Output Directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     Config.output_dir = os.path.join(Config.output_dir, timestamp)
     os.makedirs(Config.output_dir, exist_ok=True)
     
     # Save configuration
-    save_config(Config, Config.output_dir)
-    
+    config_dict = {k: v for k, v in Config.__dict__.items() if not k.startswith('__') and not callable(v)}
+    with open(os.path.join(Config.output_dir, 'config.json'), 'w') as f:
+        json.dump(config_dict, f, indent=4)
+    print(f"Configuration saved to {os.path.join(Config.output_dir, 'config.json')}")
     print("\n" + "="*60)
     print("CONFIGURATION")
     print("="*60)
@@ -471,6 +847,7 @@ def main():
     print(f"Epochs (Q&A):      {Config.epochs}")
     print(f"Batch Size:        {Config.batch_size}")
     print(f"N Splits (CV):     {Config.n_splits}")
+    print(f"Run Folds:         {run_folds}")
     print(f"Learning Rate:")
     print(f"  - BERT:          {Config.lr_bert}")
     print(f"  - Head:          {Config.lr_head}")
@@ -525,6 +902,8 @@ def main():
     q_test_dataset = TensorDataset(*test_question_only_inputs)
 
     for fold, (train_idx, valid_idx) in enumerate(fold_ids):
+        if fold >= run_folds:
+            break
         print(f"Starting Fold {fold+1}/{Config.n_splits}")
         
         train_inputs_fold = [inputs[i][train_idx] for i in range(3)]
@@ -558,7 +937,11 @@ def main():
     # Let's stick to the notebook logic:
     
     # 1. Get val preds per each epoch
-    n_epochs_total = len(histories[0][0]) # q_epochs + epochs (actually the notebook returns list of lists)
+    if len(histories) > 0:
+        n_epochs_total = len(histories[0][0]) # q_epochs + epochs (actually the notebook returns list of lists)
+    else:
+        n_epochs_total = 0
+        
     # Wait, the notebook returns `valid_predictions` which is a list of preds for each epoch.
     # In `train_and_predict` I append to `valid_predictions` in both loops.
     # So `histories[fold][0]` is a list of arrays, one for each epoch.
@@ -566,7 +949,11 @@ def main():
     val_preds_list = []
     for epoch in range(n_epochs_total):
         val_preds_one_epoch = np.zeros([len(df_train), 30])
-        for fold, (train_idx, valid_idx) in enumerate(fold_ids):
+        for fold in range(len(histories)): # Use len(histories) instead of enumerate(fold_ids)
+            # We need to know valid_idx for this fold. 
+            # fold_ids is a list of (train_idx, valid_idx)
+            _, valid_idx = fold_ids[fold]
+            
             val_pred = histories[fold][0][epoch]
             val_preds_one_epoch[valid_idx, :] += val_pred
         val_preds_list.append(val_preds_one_epoch)
@@ -580,10 +967,10 @@ def main():
     test_preds_list = []
     for epoch in range(n_epochs_total):
         test_preds_one_epoch = 0
-        for fold in range(len(fold_ids)):
+        for fold in range(len(histories)):
             test_preds = histories[fold][1][epoch]
             test_preds_one_epoch += test_preds
-        test_preds_one_epoch = test_preds_one_epoch / len(fold_ids)
+        test_preds_one_epoch = test_preds_one_epoch / len(histories)
         test_preds_list.append(test_preds_one_epoch)
 
     test_predictions = np.zeros((n_epochs_total, len(df_test), len(output_categories)), dtype=np.float32)
@@ -592,65 +979,73 @@ def main():
             test_predictions[epoch, :, j] = test_preds_list[epoch][:, j]
 
     # LightGBM Stacking
-    print("Training LightGBM Stacking...")
-    sub = pd.read_csv(os.path.join(Config.data_dir, Config.sub_csv))
-        
-    final_test_preds = []
-    
-    # Simple LightGBM wrapper
-    lgb_params = {
-        "boosting_type": "gbdt",
-        "objective": "rmse",
-        "learning_rate": 0.1,
-        "max_depth": 1,
-        "seed": 71,
-        "verbose": -1
-    }
-    
-    for i_col, col_name in enumerate(output_categories):
-        y_train = compute_output_arrays(df_train, output_categories)[:, i_col]
-        
-        # Features: predictions from all epochs for this column
-        # shape: (n_samples, n_epochs)
-        x_train = oof_predictions[:, :, i_col].T 
-        x_test = test_predictions[:, :, i_col].T
-        
-        # Notebook actually concatenates ALL columns from ALL epochs?
-        # Notebook: x_train = pd.DataFrame(np.concatenate([oof_predictions[:, :, i].T for i in range(30)], axis=1))
-        # This means for each target column, it uses predictions of ALL target columns from ALL epochs as features.
-        # That's huge. Let's double check the notebook.
-        # "x_train = pd.DataFrame(np.concatenate([oof_predictions[:, :, i].T for i in range(30)], axis=1))"
-        # Yes, it concatenates everything.
-        
-        x_train_all = np.concatenate([oof_predictions[:, :, k].T for k in range(30)], axis=1)
-        x_test_all = np.concatenate([test_predictions[:, :, k].T for k in range(30)], axis=1)
-        
-        # Train LightGBM
-        # We need another CV here? Notebook uses `model.cv` which does CV internally.
-        # To keep it simple and fast for the script, let's just train on full data and predict on test
-        # OR replicate the CV logic if we want to be exact.
-        # Notebook uses `fold_ids` for CV in LightGBM.
-        
-        test_preds_col = np.zeros(len(df_test))
-        
-        # CV for LightGBM
-        for trn_idx, val_idx in fold_ids:
-            x_trn_fold = x_train_all[trn_idx]
-            y_trn_fold = y_train[trn_idx]
-            x_val_fold = x_train_all[val_idx]
-            y_val_fold = y_train[val_idx]
+    if len(histories) == Config.n_splits:
+        print("Training LightGBM Stacking...")
+        sub = pd.read_csv(os.path.join(Config.data_dir, Config.sub_csv))
             
-            d_train = lgb.Dataset(x_trn_fold, label=y_trn_fold)
-            d_valid = lgb.Dataset(x_val_fold, label=y_val_fold)
+        final_test_preds = []
+        
+        # Simple LightGBM wrapper
+        lgb_params = {
+            "boosting_type": "gbdt",
+            "objective": "rmse",
+            "learning_rate": 0.1,
+            "max_depth": 1,
+            "seed": 71,
+            "verbose": -1
+        }
+        
+        for i_col, col_name in enumerate(output_categories):
+            y_train = compute_output_arrays(df_train, output_categories)[:, i_col]
             
-            model = lgb.train(lgb_params, d_train, num_boost_round=5000, 
-                              valid_sets=[d_valid], 
-                              callbacks=[lgb.early_stopping(stopping_rounds=20)])
+            # Features: predictions from all epochs for this column
+            # shape: (n_samples, n_epochs)
+            x_train = oof_predictions[:, :, i_col].T 
+            x_test = test_predictions[:, :, i_col].T
             
-            test_preds_col += model.predict(x_test_all) / len(fold_ids)
+            # Notebook actually concatenates ALL columns from ALL epochs?
+            # Notebook: x_train = pd.DataFrame(np.concatenate([oof_predictions[:, :, i].T for i in range(30)], axis=1))
+            # This means for each target column, it uses predictions of ALL target columns from ALL epochs as features.
+            # That's huge. Let's double check the notebook.
+            # "x_train = pd.DataFrame(np.concatenate([oof_predictions[:, :, i].T for i in range(30)], axis=1))"
+            # Yes, it concatenates everything.
             
-        final_test_preds.append(test_preds_col)
-        print(f"Finished LightGBM for {col_name}")
+            x_train_all = np.concatenate([oof_predictions[:, :, k].T for k in range(30)], axis=1)
+            x_test_all = np.concatenate([test_predictions[:, :, k].T for k in range(30)], axis=1)
+            
+            # Train LightGBM
+            # We need another CV here? Notebook uses `model.cv` which does CV internally.
+            # To keep it simple and fast for the script, let's just train on full data and predict on test
+            # OR replicate the CV logic if we want to be exact.
+            # Notebook uses `fold_ids` for CV in LightGBM.
+            
+            test_preds_col = np.zeros(len(df_test))
+            
+            # CV for LightGBM
+            for trn_idx, val_idx in fold_ids:
+                x_trn_fold = x_train_all[trn_idx]
+                y_trn_fold = y_train[trn_idx]
+                x_val_fold = x_train_all[val_idx]
+                y_val_fold = y_train[val_idx]
+                
+                d_train = lgb.Dataset(x_trn_fold, label=y_trn_fold)
+                d_valid = lgb.Dataset(x_val_fold, label=y_val_fold)
+                
+                model = lgb.train(lgb_params, d_train, num_boost_round=5000, 
+                                  valid_sets=[d_valid], 
+                                  callbacks=[lgb.early_stopping(stopping_rounds=20)])
+                
+                test_preds_col += model.predict(x_test_all) / len(fold_ids)
+                
+            final_test_preds.append(test_preds_col)
+            print(f"Finished LightGBM for {col_name}")
+    else:
+        print("Skipping LightGBM Stacking because not all folds were run.")
+        # Use simple averaging of the last epoch predictions if LightGBM is skipped
+        # Or better, use the average of all test predictions we computed above
+        # The test_predictions array is (n_epochs, n_samples, n_targets)
+        # Let's use the last epoch's prediction as a simple fallback
+        final_test_preds = test_predictions[-1].T # (n_targets, n_samples)
 
     if Config.local_eval:
         sub = pd.DataFrame(columns=['qa_id'] + output_categories)
