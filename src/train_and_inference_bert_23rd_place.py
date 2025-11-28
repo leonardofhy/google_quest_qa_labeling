@@ -31,7 +31,7 @@ class Config:
     max_sequence_length = 512
     epochs = 3
     q_epochs = 3
-    batch_size = 256 
+    batch_size = 8 
     n_splits = 5
     
     # Optimizer
@@ -175,8 +175,9 @@ class Model(nn.Module):
         # Find the index of the first [SEP] token
         # input_ids: [CLS] Title + Question [SEP] Answer [SEP]
         # We want the first [SEP] to separate Question and Answer
-        mask = (input_ids == self.sep_token_id)
-        question_answer_seps = mask.to(torch.long).argmax(dim=-1)
+        # Use token_type_ids to find the separator between Question and Answer
+        # token_type_ids: 0 for Question, 1 for Answer. Padding is 0 but masked out.
+        question_answer_seps = (torch.sum((token_type_ids == 0) * attention_mask, -1) - 1)
         
         # DeBERTa v3 doesn't use token_type_ids, check if model supports it
         if hasattr(self.config, 'type_vocab_size') and self.config.type_vocab_size > 0:
