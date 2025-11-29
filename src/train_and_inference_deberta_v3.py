@@ -29,20 +29,22 @@ class Config:
     seed = 42
     model_name = "microsoft/deberta-v3-large"
     max_sequence_length = 1024
-    epochs = 5
-    q_epochs = 5
+    epochs_phase2 = 3
+    epochs_phase1 = 3
     batch_size = 8
+    gradient_accumulation_steps = 1
     n_splits = 5
     
     # Optimizer
-    lr_bert = 2e-5
-    lr_head = 1e-4
+    encoder_lr = 1e-5
+    head_lr = 1e-4
     weight_decay = 1e-2
+    max_grad_norm = 1.0
     
     # AWP (Disabled for final run)
-    adv_lr = 0.0
-    adv_eps = 1e-3
-    adv_start_epoch = 2
+    awp_lr = 0.0
+    awp_eps = 1e-3
+    awp_start_epoch = 2
     
     # Loss Weights
     bce_weight = 0.0
@@ -53,7 +55,7 @@ class Config:
     ranking_margin = 0.1
     
     # Spearman Loss Params
-    spearman_temperature = 1.0
+    spearman_temperature = 0.1
     
     # Automatic Weighting
     use_auto_weighting = False
@@ -246,6 +248,37 @@ class WeightedLayerPooling(nn.Module):
         weighted_average = (weight_factor*all_layer_embedding).sum(dim=0) / self.layer_weights.sum()
         return weighted_average
 
+class AttentionPooling(nn.Module):
+    """Attention-based pooling layer"""
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.attention = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.Tanh(),
+            nn.Linear(hidden_size, 1),
+        )
+    
+    def forward(self, hidden_states, attention_mask):
+        # hidden_states: (batch, seq_len, hidden_size)
+        # attention_mask: (batch, seq_len)
+        
+        attention_scores = self.attention(hidden_states).squeeze(-1)  # (batch, seq_len)
+        
+        # Mask padding tokens
+        attention_scores = attention_scores.masked_fill(
+            attention_mask == 0, float('-inf')
+        )
+        
+        attention_weights = F.softmax(attention_scores, dim=-1)  # (batch, seq_len)
+        
+        # Weighted sum
+        pooled = torch.bmm(
+            attention_weights.unsqueeze(1),  # (batch, 1, seq_len)
+            hidden_states                     # (batch, seq_len, hidden_size)
+        ).squeeze(1)  # (batch, hidden_size)
+        
+        return pooled
+
 class Model(nn.Module):
     def __init__(self, model_name=Config.model_name):
         super().__init__()
@@ -261,6 +294,9 @@ class Model(nn.Module):
             layer_weights=None
         )
         
+        # Attention Pooling (NEW)
+        self.attention_pool = AttentionPooling(config.hidden_size)
+        
         # Multi-Sample Dropout
         self.dropouts = nn.ModuleList([nn.Dropout(0.1) for _ in range(5)])
         self.linear = nn.Linear(config.hidden_size, 30)
@@ -273,19 +309,15 @@ class Model(nn.Module):
         all_hidden_states = torch.stack(outputs.hidden_states)
         weighted_pooling_embeddings = self.pooler(all_hidden_states)
         
-        # Mean Pooling on the weighted embeddings
-        input_mask_expanded = attention_mask.unsqueeze(-1).expand(weighted_pooling_embeddings.size()).float()
-        sum_embeddings = torch.sum(weighted_pooling_embeddings * input_mask_expanded, 1)
-        sum_mask = input_mask_expanded.sum(1)
-        sum_mask = torch.clamp(sum_mask, min=1e-9)
-        mean_embeddings = sum_embeddings / sum_mask
+        # Attention Pooling (instead of Mean Pooling)
+        pooled_output = self.attention_pool(weighted_pooling_embeddings, attention_mask)
         
         # Multi-Sample Dropout
         for i, dropout in enumerate(self.dropouts):
             if i == 0:
-                x = self.linear(dropout(mean_embeddings))
+                x = self.linear(dropout(pooled_output))
             else:
-                x += self.linear(dropout(mean_embeddings))
+                x += self.linear(dropout(pooled_output))
         
         x = x / len(self.dropouts)
         return x
@@ -386,8 +418,8 @@ class AWP:
         model,
         optimizer,
         adv_param="weight",
-        adv_lr=1,
-        adv_eps=0.2,
+        awp_lr=1,
+        awp_eps=0.2,
         start_epoch=0,
         adv_step=1,
         scaler=None
@@ -395,8 +427,8 @@ class AWP:
         self.model = model
         self.optimizer = optimizer
         self.adv_param = adv_param
-        self.adv_lr = adv_lr
-        self.adv_eps = adv_eps
+        self.awp_lr = awp_lr
+        self.awp_eps = awp_eps
         self.start_epoch = start_epoch
         self.adv_step = adv_step
         self.backup = {}
@@ -404,7 +436,7 @@ class AWP:
         self.scaler = scaler
 
     def attack_backward(self, inputs, labels, label_weights, epoch, config, spearman_loss_fn=None, auto_loss_fn=None, question_only=False):
-        if (self.adv_lr == 0) or (epoch < self.start_epoch):
+        if (self.awp_lr == 0) or (epoch < self.start_epoch):
             return None
 
         self._save() 
@@ -443,7 +475,7 @@ class AWP:
                 norm1 = torch.norm(param.grad)
                 norm2 = torch.norm(param.data.detach())
                 if norm1 != 0 and not torch.isnan(norm1):
-                    r_at = self.adv_lr * param.grad / (norm1 + e) * (norm2 + e)
+                    r_at = self.awp_lr * param.grad / (norm1 + e) * (norm2 + e)
                     param.data.add_(r_at)
                     param.data = torch.min(
                         torch.max(param.data, self.backup_eps[name][0]), self.backup_eps[name][1]
@@ -455,7 +487,7 @@ class AWP:
             if param.requires_grad and param.grad is not None and self.adv_param in name:
                 if name not in self.backup:
                     self.backup[name] = param.data.clone()
-                    grad_eps = self.adv_eps * param.abs().detach()
+                    grad_eps = self.awp_eps * param.abs().detach()
                     self.backup_eps[name] = (
                         self.backup[name] - grad_eps,
                         self.backup[name] + grad_eps,
@@ -597,12 +629,12 @@ def save_config(config, output_dir):
         "seed": config.seed,
         "model_name": config.model_name,
         "max_sequence_length": config.max_sequence_length,
-        "epochs": config.epochs,
-        "q_epochs": config.q_epochs,
+        "epochs_phase2": config.epochs_phase2,
+        "epochs_phase1": config.epochs_phase1,
         "batch_size": config.batch_size,
         "n_splits": config.n_splits,
-        "lr_bert": config.lr_bert,
-        "lr_head": config.lr_head,
+        "encoder_lr": config.encoder_lr,
+        "head_lr": config.head_lr,
         "weight_decay": config.weight_decay,
         "data_dir": config.data_dir,
         "output_dir": config.output_dir,
@@ -636,13 +668,13 @@ def train_and_predict(train_data, valid_data, test_data, q_train_data, q_valid_d
     optimizer_grouped_parameters.append({
         "params": [p for n, p in model.named_parameters() if "bert" not in n],
         "weight_decay": config.weight_decay,
-        "lr": config.lr_head
+        "lr": config.head_lr
     })
     
     # 2. DeBERTa Layers (Decaying LR)
     # DeBERTa v3 base has 12 layers. 
-    # Layer 11 (top) gets lr_bert, Layer 0 (bottom) gets lr_bert * (decay ** 11)
-    # Embeddings get lr_bert * (decay ** 12)
+    # Layer 11 (top) gets encoder_lr, Layer 0 (bottom) gets encoder_lr * (decay ** 11)
+    # Embeddings get encoder_lr * (decay ** 12)
     
     layer_decay = 0.9
     num_layers = model.config.num_hidden_layers
@@ -651,7 +683,7 @@ def train_and_predict(train_data, valid_data, test_data, q_train_data, q_valid_d
     optimizer_grouped_parameters.append({
         "params": [p for n, p in model.named_parameters() if "embeddings" in n],
         "weight_decay": config.weight_decay,
-        "lr": config.lr_bert * (layer_decay ** num_layers)
+        "lr": config.encoder_lr * (layer_decay ** num_layers)
     })
     
     # Encoder Layers
@@ -663,7 +695,7 @@ def train_and_predict(train_data, valid_data, test_data, q_train_data, q_valid_d
         optimizer_grouped_parameters.append({
             "params": layer_params,
             "weight_decay": config.weight_decay,
-            "lr": config.lr_bert * (layer_decay ** (num_layers - 1 - layer_i))
+            "lr": config.encoder_lr * (layer_decay ** (num_layers - 1 - layer_i))
         })
         
     # Other parameters (Pooler, etc. if any, though we replaced pooler)
@@ -678,7 +710,7 @@ def train_and_predict(train_data, valid_data, test_data, q_train_data, q_valid_d
         optimizer_grouped_parameters.append({
             "params": remaining_params,
             "weight_decay": config.weight_decay,
-            "lr": config.lr_bert
+            "lr": config.encoder_lr
         })
         
     # Automatic Weighting Parameters
@@ -694,8 +726,8 @@ def train_and_predict(train_data, valid_data, test_data, q_train_data, q_valid_d
 
     optimizer = AdamW(optimizer_grouped_parameters)
     scheduler = get_linear_schedule_with_warmup(
-        optimizer, num_warmup_steps=int(len(q_dataloader) * (config.q_epochs) * 0.05),
-        num_training_steps=len(q_dataloader) * (config.q_epochs)
+        optimizer, num_warmup_steps=int(len(q_dataloader) * (config.epochs_phase1) * 0.1),
+        num_training_steps=len(q_dataloader) * (config.epochs_phase1)
     )
     
     test_predictions = []
@@ -709,7 +741,7 @@ def train_and_predict(train_data, valid_data, test_data, q_train_data, q_valid_d
     
     # Initialize AWP
     # Start AWP from epoch 1 (second epoch) to let model stabilize first
-    awp = AWP(model, optimizer, adv_lr=config.adv_lr, adv_eps=config.adv_eps, start_epoch=config.adv_start_epoch, scaler=scaler)
+    awp = AWP(model, optimizer, awp_lr=config.awp_lr, awp_eps=config.awp_eps, start_epoch=config.awp_start_epoch, scaler=scaler)
 
     # Initialize SoftSpearmanLoss
     spearman_loss_fn = SoftSpearmanLoss(temperature=config.spearman_temperature).to(device)
@@ -718,47 +750,48 @@ def train_and_predict(train_data, valid_data, test_data, q_train_data, q_valid_d
     print(f"Fold {fold}: Training Question Only")
     best_q_spearman = -1
     
-    for epoch in range(config.q_epochs): 
+    accumulation_steps = config.gradient_accumulation_steps
+    
+    for epoch in range(config.epochs_phase1): 
         start = time.time()
         model.train()
         train_losses = []
         train_preds = []
         train_targets = []
-        for input_ids, token_type_ids, attention_mask, targets in tqdm(q_dataloader, total=len(q_dataloader), desc=f"Epoch {epoch+1}/{config.q_epochs}"):
+        for step, (input_ids, token_type_ids, attention_mask, targets) in enumerate(tqdm(q_dataloader, total=len(q_dataloader), desc=f"Epoch {epoch+1}/{config.epochs_phase1}")):
             input_ids = input_ids.to(device)
             token_type_ids = token_type_ids.to(device)
             attention_mask = attention_mask.to(device)
             targets = targets.to(device)
             
-            # Clear gradients at start of step
-            optimizer.zero_grad()
+            # Clear gradients at start of step only if not accumulating
+            if step % accumulation_steps == 0:
+                optimizer.zero_grad()
             
             with torch.cuda.amp.autocast():
                 outputs = model(input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
                 if config.use_auto_weighting:
                     loss_dict = compute_loss(outputs, targets, label_weights, config, spearman_loss_fn, question_only=True, return_dict=True)
-                    # For Q-Only, we might only care about BCE and Ranking? Or all 3?
-                    # Let's use all 3 but Spearman might be noisy on small batch?
-                    # Actually, Q-Only phase usually doesn't use Spearman in my previous code?
-                    # Wait, previous code passed `spearman_loss_fn` to `compute_loss` even in Q-Only.
-                    # So let's be consistent.
                     loss = auto_loss_fn(loss_dict['bce'], loss_dict['ranking'], loss_dict['spearman'])
                 else:
                     loss = compute_loss(outputs, targets, label_weights, config, spearman_loss_fn, question_only=True)
+                
+                loss = loss / accumulation_steps
             
             scaler.scale(loss).backward()
             
-            # AWP Attack - SKIP for Q-Only phase
-            # inputs = (input_ids, token_type_ids, attention_mask)
-            # awp.attack_backward(inputs, targets, label_weights, epoch, config, spearman_loss_fn, auto_loss_fn, question_only=True)
-            
-            scaler.step(optimizer)
-            scaler.update()
-            scheduler.step()
+            if (step + 1) % accumulation_steps == 0:
+                # Gradient Clipping
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+                
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
             
             train_preds.extend(outputs.detach().sigmoid().cpu().numpy())
             train_targets.extend(targets.detach().cpu().numpy())
-            train_losses.append(loss.detach().cpu().item())
+            train_losses.append(loss.detach().cpu().item() * accumulation_steps)
         
         model.eval()
         valid_losses = []
@@ -846,7 +879,7 @@ def train_and_predict(train_data, valid_data, test_data, q_train_data, q_valid_d
     optimizer_grouped_parameters.append({
         "params": [p for n, p in model.named_parameters() if "bert" not in n],
         "weight_decay": config.weight_decay,
-        "lr": config.lr_head
+        "lr": config.head_lr
     })
     
     # 2. DeBERTa Layers (Decaying LR)
@@ -857,7 +890,7 @@ def train_and_predict(train_data, valid_data, test_data, q_train_data, q_valid_d
     optimizer_grouped_parameters.append({
         "params": [p for n, p in model.named_parameters() if "embeddings" in n],
         "weight_decay": config.weight_decay,
-        "lr": config.lr_bert * (layer_decay ** num_layers)
+        "lr": config.encoder_lr * (layer_decay ** num_layers)
     })
     
     # Encoder Layers
@@ -866,7 +899,7 @@ def train_and_predict(train_data, valid_data, test_data, q_train_data, q_valid_d
         optimizer_grouped_parameters.append({
             "params": layer_params,
             "weight_decay": config.weight_decay,
-            "lr": config.lr_bert * (layer_decay ** (num_layers - 1 - layer_i))
+            "lr": config.encoder_lr * (layer_decay ** (num_layers - 1 - layer_i))
         })
         
     # Remaining
@@ -879,7 +912,7 @@ def train_and_predict(train_data, valid_data, test_data, q_train_data, q_valid_d
         optimizer_grouped_parameters.append({
             "params": remaining_params,
             "weight_decay": config.weight_decay,
-            "lr": config.lr_bert
+            "lr": config.encoder_lr
         })
 
     # Automatic Weighting Parameters (Reset for Q&A phase? Or reuse?)
@@ -898,34 +931,37 @@ def train_and_predict(train_data, valid_data, test_data, q_train_data, q_valid_d
         })
 
     optimizer = AdamW(optimizer_grouped_parameters)
-    scheduler = get_linear_schedule_with_warmup(
-        optimizer, num_warmup_steps=int(len(dataloader) * (config.epochs) * 0.05),
-        num_training_steps=len(dataloader) * (config.epochs)
-    )
-
+    
     scaler = torch.cuda.amp.GradScaler()
     
+    # Re-init scheduler for Q&A phase
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer, num_warmup_steps=int(len(dataloader) * (config.epochs_phase2) * 0.1),
+        num_training_steps=len(dataloader) * (config.epochs_phase2)
+    )
+
     # Initialize AWP for Q&A phase
-    awp = AWP(model, optimizer, adv_lr=config.adv_lr, adv_eps=config.adv_eps, start_epoch=config.adv_start_epoch, scaler=scaler)
+    awp = AWP(model, optimizer, awp_lr=config.awp_lr, awp_eps=config.awp_eps, start_epoch=config.awp_start_epoch, scaler=scaler)
 
     # Initialize SoftSpearmanLoss
     spearman_loss_fn = SoftSpearmanLoss(temperature=config.spearman_temperature).to(device)
 
     best_qa_spearman = -1
 
-    for epoch in range(config.epochs): 
+    for epoch in range(config.epochs_phase2): 
         start = time.time()
         model.train()
         train_losses = []
         train_preds = []
         train_targets = []
-        for input_ids, token_type_ids, attention_mask, targets in tqdm(dataloader, total=len(dataloader), desc=f"Epoch {epoch+1}/{config.epochs}"):
+        for step, (input_ids, token_type_ids, attention_mask, targets) in enumerate(tqdm(dataloader, total=len(dataloader), desc=f"Epoch {epoch+1}/{config.epochs_phase2}")):
             input_ids = input_ids.to(device)
             token_type_ids = token_type_ids.to(device)
             attention_mask = attention_mask.to(device)
             targets = targets.to(device)
             
-            optimizer.zero_grad()
+            if step % accumulation_steps == 0:
+                optimizer.zero_grad()
             
             with torch.cuda.amp.autocast():
                 outputs = model(input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
@@ -934,20 +970,26 @@ def train_and_predict(train_data, valid_data, test_data, q_train_data, q_valid_d
                     loss = auto_loss_fn(loss_dict['bce'], loss_dict['ranking'], loss_dict['spearman'])
                 else:
                     loss = compute_loss(outputs, targets, label_weights, config, spearman_loss_fn)
+                
+                loss = loss / accumulation_steps
             
             scaler.scale(loss).backward()
             
             # AWP Attack
-            inputs = (input_ids, token_type_ids, attention_mask)
-            awp.attack_backward(inputs, targets, label_weights, epoch, config, spearman_loss_fn, auto_loss_fn, question_only=False)
+            # inputs = (input_ids, token_type_ids, attention_mask)
+            # awp.attack_backward(inputs, targets, label_weights, epoch, config, spearman_loss_fn, auto_loss_fn)
             
-            scaler.step(optimizer)
-            scaler.update()
-            scheduler.step()
+            if (step + 1) % accumulation_steps == 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+                
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
             
             train_preds.extend(outputs.detach().sigmoid().cpu().numpy())
             train_targets.extend(targets.detach().cpu().numpy())
-            train_losses.append(loss.detach().cpu().item())
+            train_losses.append(loss.detach().cpu().item() * accumulation_steps)
         
         model.eval()
         valid_losses = []
@@ -1024,8 +1066,8 @@ def main():
     parser.add_argument("--data_dir", type=str, default=Config.data_dir, help="Directory containing train.csv and test.csv")
     parser.add_argument("--output_dir", type=str, default=Config.output_dir, help="Directory to save submission")
     parser.add_argument("--local_eval", action="store_true", help="Run in local evaluation mode (split train into train/test)")
-    parser.add_argument("--epochs", type=int, default=Config.epochs, help="Number of epochs for Q&A training")
-    parser.add_argument("--q_epochs", type=int, default=Config.q_epochs, help="Number of epochs for Question-only training")
+    parser.add_argument("--epochs_phase2", type=int, default=Config.epochs_phase2, help="Number of epochs for Q&A training")
+    parser.add_argument("--epochs_phase1", type=int, default=Config.epochs_phase1, help="Number of epochs for Question-only training")
     parser.add_argument("--folds", type=int, default=Config.n_splits, help="Number of folds to run")
     args = parser.parse_args()
 
@@ -1033,8 +1075,8 @@ def main():
     Config.data_dir = args.data_dir
     Config.output_dir = args.output_dir
     Config.local_eval = args.local_eval
-    Config.epochs = args.epochs
-    Config.q_epochs = args.q_epochs
+    Config.epochs_phase2 = args.epochs_phase2
+    Config.epochs_phase1 = args.epochs_phase1
     
     # We don't update Config.n_splits because that affects KFold splitting logic.
     # We only control how many folds we iterate over.
@@ -1059,19 +1101,20 @@ def main():
     print("="*60)
     print(f"Model Name:        {Config.model_name}")
     print(f"Max Seq Length:    {Config.max_sequence_length}")
-    print(f"Epochs (Q):        {Config.q_epochs}")
-    print(f"Epochs (Q&A):      {Config.epochs}")
+    print(f"Epochs (Phase 1):  {Config.epochs_phase1}")
+    print(f"Epochs (Phase 2):  {Config.epochs_phase2}")
     print(f"Batch Size:        {Config.batch_size}")
+    print(f"Grad Accum Steps:  {Config.gradient_accumulation_steps}")
     print(f"N Splits (CV):     {Config.n_splits}")
     print(f"Run Folds:         {run_folds}")
     print(f"Learning Rate:")
-    print(f"  - BERT:          {Config.lr_bert}")
-    print(f"  - Head:          {Config.lr_head}")
+    print(f"  - Encoder:       {Config.encoder_lr}")
+    print(f"  - Head:          {Config.head_lr}")
     print(f"Weight Decay:      {Config.weight_decay}")
     print(f"AWP:")
-    print(f"  - LR:            {Config.adv_lr}")
-    print(f"  - EPS:           {Config.adv_eps}")
-    print(f"  - Start Epoch:   {Config.adv_start_epoch}")
+    print(f"  - LR:            {Config.awp_lr}")
+    print(f"  - EPS:           {Config.awp_eps}")
+    print(f"  - Start Epoch:   {Config.awp_start_epoch}")
     print(f"Loss Weights:")
     print(f"  - BCE:           {Config.bce_weight}")
     print(f"  - Ranking:       {Config.ranking_weight}")
@@ -1300,7 +1343,7 @@ def main():
         summary = {
             "local_spearman_score": float(local_score),
             "n_folds": Config.n_splits,
-            "total_epochs_per_fold": Config.q_epochs + Config.epochs,
+            "total_epochs_per_fold": Config.epochs_phase1 + Config.epochs_phase2,
             "training_complete": True,
             "completed_at": datetime.now().isoformat()
         }
@@ -1311,7 +1354,7 @@ def main():
         # Save final summary
         summary = {
             "n_folds": Config.n_splits,
-            "total_epochs_per_fold": Config.q_epochs + Config.epochs,
+            "total_epochs_per_fold": Config.epochs_phase1 + Config.epochs_phase2,
             "training_complete": True,
             "completed_at": datetime.now().isoformat()
         }
