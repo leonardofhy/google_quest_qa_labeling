@@ -49,7 +49,8 @@ This document tracks the experiments conducted for the Google QUEST Q&A Labeling
 | **Exp 15** | DeBERTa v3 Base (Rank+Spear+AWP) | 0.3925 (5-fold) | 0.3215 | **Rank+Spear** + **AWP**. 3 epochs. | ✅ Done |
 | **Exp 16** | DeBERTa v3 Large (Rank+Spear) | - | - | **Cancelled**. Replaced by Exp 18. | ❌ Cancelled |
 | **Exp 17** | DeBERTa v3 Base (Optimized) | 0.3887 (1-fold) | 0.3104 | **BCE+Rank+Spear (0.2+0.4+0.4)** + **Attention Pooling** + **Warmup 10%**. **Fold 0 only (3 epochs)**. | ✅ Done |
-| **Exp 18** | DeBERTa v3 Large (Optimized) | TBD | TBD | **Large Model** + Exp 17 Config + **LR 1e-5** + **3 Epochs**. | 🔄 Ready to Start |
+| **Exp 18** | DeBERTa v3 Large (Optimized) | 0.4026 (1-fold) | 0.3027 | **Large Model** + Exp 17 Config. **Fold 0 only**. | ✅ Done |
+| **Exp 19** | DeBERTa v3 Large (Rank+Spear) | **0.4090** (1-fold) | 0.3070 | **Large Model** + **Rank+Spear Only (No BCE)**. **Fold 0 only**. | ✅ Done |
 
 ### Detailed Results
 
@@ -330,8 +331,8 @@ This document tracks the experiments conducted for the Google QUEST Q&A Labeling
     - **Conclusion**: Validated that the architecture works. Ready to scale to Large model.
 
 #### Exp 18: DeBERTa v3 Large (Optimized Architecture + Hybrid Loss)
-- **Log**: TBD
-- **CV Score (Spearman)**: TBD
+- **Log**: `models/20251130_030948/summary.json`
+- **CV Score (Spearman)**: **0.4026** (Fold 0, Epoch 3)
 - **Configuration**:
     - Model: `microsoft/deberta-v3-large`
     - Seq Len: 1024
@@ -342,8 +343,31 @@ This document tracks the experiments conducted for the Google QUEST Q&A Labeling
     - Epochs: **3 (Phase 1) + 3 (Phase 2)**
     - Batch Size: **8** (Grad Accum 1)
     - AWP: **Disabled**
-    - Training: 5 Folds
-- **Status**: 🔄 Ready to Start
+    - Training: **Fold 0 only**
+- **Fold 0 Performance (Q&A Phase)**:
+    - Epoch 1: Loss 0.3173, Spearman 0.3786
+    - Epoch 2: Loss 0.3049, Spearman 0.4001
+    - Epoch 3: Loss 0.3027, Spearman **0.4026** (best)
+- **Note**: 
+    - **Strong Performance**: 0.4026 is a solid score for a single fold.
+    - **Comparison**: Significantly better than Base model (Exp 17: 0.3887).
+    - **Loss**: Hybrid loss seems stable.
+
+#### Exp 19: DeBERTa v3 Large (Rank+Spear Only)
+- **Log**: `models/20251130_031952/summary.json`
+- **CV Score (Spearman)**: **0.4090** (Fold 0, Epoch 3)
+- **Configuration**:
+    - Model: `microsoft/deberta-v3-large`
+    - Config: Same as Exp 18 but **Loss = Ranking (0.5) + Spearman (0.5)** (No BCE)
+    - Training: **Fold 0 only**
+- **Fold 0 Performance (Q&A Phase)**:
+    - Epoch 1: Loss 0.3213, Spearman 0.3890
+    - Epoch 2: Loss 0.3095, Spearman 0.4069
+    - Epoch 3: Loss 0.3070, Spearman **0.4090** (best)
+- **Note**: 
+    - 🎯 **New Best Single-Fold Score**: 0.4090 beats Exp 18 (0.4026) by +0.0064.
+    - **Confirmation**: Removing BCE consistently improves performance on this dataset (similar to Exp 14 vs Exp 11 on Base model).
+    - **Recommendation**: Use this configuration for the final 5-fold run.
 
 
 ## Analysis Notes
