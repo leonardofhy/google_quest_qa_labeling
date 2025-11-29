@@ -36,7 +36,9 @@ This document tracks the experiments conducted for the Google QUEST Q&A Labeling
 | **Exp 2** | DeBERTa v3 (Advanced) | ~0.3586 (Fold 0) | ~0.1696 | + WLP, MSD, LLRD. | ✅ Done (Local) |
 | **Exp 3** | DeBERTa v3 (Adv + H+T) | **~0.3642 (Fold 0)** | **~0.1692** | + Head+Tail Truncation. Seq Len 512. | ✅ Done (Local) |
 | **Exp 4** | DeBERTa v3 (Adv + H+T + Seq1024) | **~0.3797 (Fold 0)** | **~0.1678** | Increased Seq Len to 1024. **No AWP**. | ✅ Done (Local) |
-| **Exp 5** | DeBERTa v3 (Adv + H+T + AWP) | *Pending* | *Pending* | + Adversarial Weight Perturbation (AWP). Seq Len 512. | ⏳ Planned |
+| **Exp 5** | DeBERTa v3 (Adv + H+T + AWP + Seq1024) | ~0.2734 (Q Only) | ~0.1538 (Q Only) | + AWP (eps=1e-2). Seq Len 1024. | ❌ Failed (Drop) |
+| **Exp 6** | DeBERTa v3 (Adv + H+T + Low AWP + Seq1024) | ~0.3354 (Fold 0) | ~0.1700 | + AWP (eps=1e-3). Seq Len 1024. | ❌ Failed (Drop) |
+| **Exp 7** | DeBERTa v3 Large (Adv + H+T + Seq1024) | **0.4218** | ~0.15 (est) | **Large Model**. **No AWP**. | ✅ Done |
 
 ### Detailed Results
 
@@ -47,7 +49,7 @@ This document tracks the experiments conducted for the Google QUEST Q&A Labeling
     - Q&A: Loss 0.1700, Spearman 0.3465
 
 #### Exp 2: DeBERTa v3 (Advanced)
-- **Log**: `models/20251129_025244/training_log.jsonl` (Middle entries)
+- **Log**: `models/20251129_035208/training_log.jsonl` (Middle entries)
 - **Fold 0 Metrics (Epoch 3)**:
     - Q Only: Loss 0.1517, Spearman 0.2795
     - Q&A: Loss 0.1696, Spearman 0.3586
@@ -65,6 +67,33 @@ This document tracks the experiments conducted for the Google QUEST Q&A Labeling
     - Q&A: Loss 0.1678, Spearman 0.3797
     - **Note**: Surpassed Baseline (0.3782) in single-fold performance!
 
+#### Exp 5: DeBERTa v3 (Adv + H+T + AWP + Seq1024)
+- **Log**: `models/20251129_055237/training_log.jsonl`
+- **Fold 0 Metrics (Epoch 3)**:
+    - Q Only: Loss 0.1538, Spearman 0.2734
+    - Q&A: Loss 0.1707, Spearman 0.3356
+    - **Note**: Significant performance drop observed (0.3797 -> 0.3356). AWP epsilon 1e-2 was too aggressive.
+
+#### Exp 6: DeBERTa v3 (Adv + H+T + Low AWP + Seq1024)
+- **Log**: `models/20251129_061146/training_log.jsonl`
+- **Fold 0 Metrics (Epoch 3)**:
+    - Q Only: Loss 0.1530, Spearman 0.2750
+    - Q&A: Loss 0.1700, Spearman 0.3354
+    - **Note**: Lowering AWP epsilon to 1e-3 did not recover performance (0.3797 -> 0.3354). Decided to disable AWP for Large model training.
+
+#### Exp 7: DeBERTa v3 Large (Adv + H+T + Seq1024)
+- **Log**: `models/20251129_063948/training_log.jsonl`
+- **CV Score (Spearman)**: **0.4218** (Local Eval with Stacking)
+- **Configuration**:
+    - Model: `microsoft/deberta-v3-large`
+    - Max Seq Length: 1024
+    - AWP: **Disabled** (`adv_lr=0`)
+    - Folds: 5 (Full CV)
+- **Note**: 
+    - **Surpassed Best Baseline (0.4195)**.
+    - Successfully scaled up to Large model with 1024 sequence length (AWP disabled).
+    - Includes LightGBM Stacking on local evaluation.
+
 ## Analysis Notes
 
 - **Baseline Strength**: The baseline achieves a very high CV of 0.4195. This is likely due to the combination of:
@@ -76,7 +105,7 @@ This document tracks the experiments conducted for the Google QUEST Q&A Labeling
     - Our "Advanced" model (Exp 2) improved over the "Basic" one (Exp 1).
     - **Head+Tail Truncation (Exp 3)** provided a significant boost.
     - **Seq Len 1024 (Exp 4)**: Increasing sequence length to 1024 provided a massive boost (+0.0155), surpassing the Baseline's single-fold performance. This confirms that truncation was a major bottleneck.
-    - **AWP (Exp 5)**: Planned next step. Expected to improve generalization further.
+    - **AWP (Exp 5)**: Initial run with `eps=1e-2` caused performance regression. Tuning epsilon to `1e-3` for Exp 6.
 
 - **Next Steps**:
     - Verify Exp 4 (AWP) results.
