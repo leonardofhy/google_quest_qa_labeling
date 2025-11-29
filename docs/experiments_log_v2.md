@@ -45,8 +45,11 @@ This document tracks the experiments conducted for the Google QUEST Q&A Labeling
 | **Exp 11** | DeBERTa v3 Base (Combined Loss C) | 0.3853 (1-fold) | 0.4959 | **Hybrid** (BCE+Rank+Spear). **Fold 0 only (3 epochs)**. | ✅ Done |
 | **Exp 12** | DeBERTa v3 Base (Auto Weighting) | **0.3836** (1-fold) | 0.4958 | **Auto Weighting** (learnable σ). **Fold 0 only (3 epochs)**. | ✅ Done |
 | **Exp 13** | DeBERTa v3 Base (Fixed AWP) | 0.3466 (1-fold) | 0.1681 | **Fixed AWP** + Exp 8 Loss. **Fold 0 only (3 epochs)**. | ✅ Done |
-| **Exp 14** | DeBERTa v3 Base (Rank+Spear) | **0.3964** (5-fold) | 0.3180 | **Rank+Spear**. No BCE. **No AWP**. 3 epochs. | ✅ Done |
+| **Exp 14** | DeBERTa v3 Base (Rank+Spear) | **0.4026** (5-fold) | 0.3180 | **Rank+Spear**. No BCE. **No AWP**. 3 epochs. | ✅ Done |
 | **Exp 15** | DeBERTa v3 Base (Rank+Spear+AWP) | 0.3925 (5-fold) | 0.3215 | **Rank+Spear** + **AWP**. 3 epochs. | ✅ Done |
+| **Exp 16** | DeBERTa v3 Large (Rank+Spear) | - | - | **Cancelled**. Replaced by Exp 18. | ❌ Cancelled |
+| **Exp 17** | DeBERTa v3 Base (Optimized) | 0.3887 (1-fold) | 0.3104 | **BCE+Rank+Spear (0.2+0.4+0.4)** + **Attention Pooling** + **Warmup 10%**. **Fold 0 only (3 epochs)**. | ✅ Done |
+| **Exp 18** | DeBERTa v3 Large (Optimized) | TBD | TBD | **Large Model** + Exp 17 Config + **LR 1e-5** + **3 Epochs**. | 🔄 Ready to Start |
 
 ### Detailed Results
 
@@ -296,6 +299,53 @@ This document tracks the experiments conducted for the Google QUEST Q&A Labeling
     - **Conclusion**: AWP consistently hurts performance across all tested configurations (Exp 5, 6, 13, 15).
     - Possible reasons: Ranking objectives are more fragile than classification; perturbations disrupt learned relative orderings.
 
+
+
+#### Exp 17: DeBERTa v3 Base (Optimized Architecture + Hybrid Loss)
+- **Log**: `models/20251130_020805/summary.json`
+- **CV Score (Spearman)**: **0.3887** (Fold 0, Epoch 3)
+- **Configuration**:
+    - Model: `microsoft/deberta-v3-base`
+    - Seq Len: 1024
+    - Loss: **Hybrid (BCE=0.2, Rank=0.4, Spear=0.4)**
+    - Pooling: **Attention Pooling** (replacing Mean Pooling)
+    - Warmup: **10%** (increased from 5%)
+    - AWP: **Disabled**
+    - Epochs: **3 (Q) + 3 (Q&A)**
+    - Training: **Fold 0 only**
+- **Fold 0 Performance (Q&A Phase)**:
+    - Epoch 1: Loss 0.3320, Spearman 0.3539
+    - Epoch 2: Loss 0.3138, Spearman 0.3809
+    - Epoch 3: Loss 0.3104, Spearman **0.3887** (best)
+- **Comparison (Base Model, Fold 0, 3 Epochs)**:
+    - Exp 10 (Rank+Spear): **0.3921**
+    - Exp 17 (Hybrid+Attn): 0.3887 (-0.0034)
+    - Exp 11 (Hybrid): 0.3888 (+0.0001)
+    - Exp 12 (Auto): 0.3876 (-0.0011)
+    - Exp 8 (BCE+Rank): 0.3820 (-0.0067)
+- **Note**: 
+    - **Solid Performance**: 0.3887 is very competitive, effectively matching Exp 11/12.
+    - **Attention Pooling** didn't yield a massive jump on Base model compared to Mean Pooling (Exp 11), but maintained performance.
+    - **Stability**: Training curve was very smooth with 10% warmup.
+    - **Conclusion**: Validated that the architecture works. Ready to scale to Large model.
+
+#### Exp 18: DeBERTa v3 Large (Optimized Architecture + Hybrid Loss)
+- **Log**: TBD
+- **CV Score (Spearman)**: TBD
+- **Configuration**:
+    - Model: `microsoft/deberta-v3-large`
+    - Seq Len: 1024
+    - Loss: **Hybrid (BCE=0.2, Rank=0.4, Spear=0.4)**
+    - Pooling: **Attention Pooling**
+    - Warmup: **10%**
+    - LR: **1e-5** (Encoder), **1e-4** (Head)
+    - Epochs: **3 (Phase 1) + 3 (Phase 2)**
+    - Batch Size: **8** (Grad Accum 1)
+    - AWP: **Disabled**
+    - Training: 5 Folds
+- **Status**: 🔄 Ready to Start
+
+
 ## Analysis Notes
 
 - **Baseline Strength**: The baseline achieves a very high CV of 0.4195. This is likely due to the combination of:
@@ -370,18 +420,26 @@ This document tracks the experiments conducted for the Google QUEST Q&A Labeling
         - AWP tested 4 times (Exp 5, 6, 13, 15) - consistently degrades performance
         - Auto weighting (Exp 12) validated as viable alternative
     
-    - 🔴 **Priority 1**: **Large Model with Optimal Loss** (HIGHEST IMPACT)
-        - Run DeBERTa-v3-Large with **Ranking + Spearman** (no BCE)
-        - Expected: > 0.44 CV (combining Large model + optimal loss)
-        - This could be the **final best model**
+    - 🔄 **In Progress - Exp 16**: **Large Model with Optimal Loss**
+        - DeBERTa-v3-Large with **Ranking + Spearman** (no BCE)
+        - Status: Training Fold 1+
+        - Early results: Fold 0 shows +1.7% over Exp 7
+        - Final verdict pending completion
     
-    - 🟡 **Priority 2**: **Ranking-only ablation**
+    - 📝 **Planned - Exp 17**: **Architecture Optimizations**
+        - Test **BCE(0.2) + Rank(0.4) + Spear(0.4)** hybrid loss
+        - Add **Attention Pooling** to replace Mean Pooling
+        - Increase **Warmup to 10%** for stable training
+        - Single fold validation before full 5-fold
+    
+    - 🟡 **Priority 2**: **Post-Processing Enhancement**
+        - Add **Distribution Matching** to LightGBM Stacking
+        - Zero training cost, potential +0.5-1.5% gain
+        - Apply to sparse/imbalanced columns only
+    
+    - 🟡 **Priority 3**: **Ranking-only ablation**
         - Test pure Ranking loss (no BCE, no Spearman) to isolate contribution
         - Determine if Spearman is truly necessary or if Ranking alone suffices
-    
-    - 🟡 **Priority 3**: **Longer Training for Exp 14**
-        - Rerun Exp 14 with 5 epochs (instead of 3)
-        - May further improve the 0.4026 raw score
     
     - 🟠 **Future Exploration**:
         - DeBERTa-v2-XXLarge (1.5B params) with Rank+Spear loss
