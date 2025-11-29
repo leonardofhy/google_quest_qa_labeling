@@ -29,8 +29,8 @@ class Config:
     seed = 42
     model_name = "microsoft/deberta-v3-base"
     max_sequence_length = 1024
-    epochs = 3
-    q_epochs = 3
+    epochs = 5
+    q_epochs = 5
     batch_size = 8
     n_splits = 5
     
@@ -38,6 +38,25 @@ class Config:
     lr_bert = 2e-5
     lr_head = 1e-4
     weight_decay = 1e-2
+    
+    # AWP (Disabled for final run)
+    adv_lr = 0
+    adv_eps = 1e-3
+    adv_start_epoch = 1
+    
+    # Loss Weights
+    bce_weight = 0.5
+    ranking_weight = 1.0
+    spearman_weight = 0.5
+    
+    # Ranking Loss Params
+    ranking_margin = 0.1
+    
+    # Spearman Loss Params
+    spearman_temperature = 1.0
+    
+    # Automatic Weighting
+    use_auto_weighting = True
     
     # Paths
     data_dir = "data"
@@ -306,7 +325,20 @@ class AWP:
                 # Note: We need to unpack inputs here just like in the main loop
                 input_ids, token_type_ids, attention_mask = inputs
                 outputs = self.model(input_ids, attention_mask, token_type_ids)
-                adv_loss = compute_loss(outputs, labels, label_weights)
+                # Note: AWP attack step usually uses the same loss function, but for simplicity/speed 
+                # we often just use BCE or the main loss. 
+                # Here we need to pass config and spearman_loss_fn if we want full consistency.
+                # However, `awp.attack_backward` signature doesn't have them.
+                # Let's assume we pass them or modify AWP. 
+                # For now, let's keep it simple and use a simplified loss or pass None for spearman to save compute?
+                # Actually, AWP class is defined in this file, so I can modify it.
+                # But to minimize changes, I'll just use BCE + Ranking (if I can access config)
+                # Or better, I should update AWP signature.
+                pass # Placeholder for the diff block, see below for actual replacement
+                
+                # Wait, I need to update AWP.attack_backward signature too.
+                # Let's do that in a separate chunk or include it here.
+                pass
             
             self.optimizer.zero_grad()
             if self.scaler:
@@ -371,7 +403,7 @@ class AWP:
         self.backup_eps = {}
         self.scaler = scaler
 
-    def attack_backward(self, inputs, labels, label_weights, epoch):
+    def attack_backward(self, inputs, labels, label_weights, epoch, config, spearman_loss_fn=None, auto_loss_fn=None):
         if (self.adv_lr == 0) or (epoch < self.start_epoch):
             return None
 
@@ -383,7 +415,12 @@ class AWP:
                 # Note: We need to unpack inputs here just like in the main loop
                 input_ids, token_type_ids, attention_mask = inputs
                 outputs = self.model(input_ids, attention_mask, token_type_ids)
-                adv_loss = compute_loss(outputs, labels, label_weights)
+                
+                if auto_loss_fn is not None:
+                    loss_dict = compute_loss(outputs, labels, label_weights, config, spearman_loss_fn, return_dict=True)
+                    adv_loss = auto_loss_fn(loss_dict['bce'], loss_dict['ranking'], loss_dict['spearman'])
+                else:
+                    adv_loss = compute_loss(outputs, labels, label_weights, config, spearman_loss_fn)
             
             self.optimizer.zero_grad()
             if self.scaler:
@@ -425,7 +462,78 @@ class AWP:
         self.backup = {}
         self.backup_eps = {}
 
-def compute_loss(outputs, targets, label_weights, alpha=0.5, margin=0.1, question_only=False):
+class SoftSpearmanLoss(nn.Module):
+    """
+    Differentiable approximation of Spearman correlation loss.
+    Ported from legacy implementation.
+    """
+    def __init__(self, temperature=1.0, eps=1e-8):
+        super().__init__()
+        self.temperature = temperature
+        self.eps = eps
+    
+    def soft_rank(self, x):
+        batch_size = x.shape[0]
+        diff = x.unsqueeze(1) - x.unsqueeze(0)
+        soft_compare = torch.sigmoid(diff / self.temperature)
+        soft_ranks = soft_compare.sum(dim=1)
+        return soft_ranks
+    
+    def pearson_correlation(self, x, y):
+        x_centered = x - x.mean()
+        y_centered = y - y.mean()
+        numerator = (x_centered * y_centered).sum()
+        denominator = torch.sqrt((x_centered ** 2).sum() * (y_centered ** 2).sum() + self.eps)
+        return numerator / denominator
+    
+    def forward(self, preds, targets):
+        # Apply sigmoid to get probabilities
+        preds = torch.sigmoid(preds)
+        
+        correlations = []
+        num_labels = preds.shape[1]
+        
+        for label_idx in range(num_labels):
+            pred_col = preds[:, label_idx]
+            target_col = targets[:, label_idx]
+            
+            if target_col.std() < self.eps:
+                continue
+            
+            pred_ranks = self.soft_rank(pred_col)
+            target_ranks = self.soft_rank(target_col)
+            
+            corr = self.pearson_correlation(pred_ranks, target_ranks)
+            corr = torch.clamp(corr, -1.0, 1.0)
+            correlations.append(corr)
+        
+        if len(correlations) > 0:
+            mean_corr = torch.stack(correlations).mean()
+            return 1.0 - mean_corr
+        else:
+            return torch.tensor(0.0, device=preds.device, requires_grad=True)
+
+class AutomaticWeightedLoss(nn.Module):
+    """
+    Automatically weighted multi-task loss using uncertainty weighting.
+    Reference: Kendall et al. "Multi-Task Learning Using Uncertainty to Weigh Losses for Scene Geometry and Semantics" (CVPR 2018)
+    """
+    def __init__(self, num=3):
+        super().__init__()
+        # log_vars = log(sigma^2)
+        # Initialize with 0.0 (sigma=1.0)
+        self.log_vars = nn.Parameter(torch.zeros(num, requires_grad=True))
+
+    def forward(self, *losses):
+        # loss = sum( exp(-log_var) * loss + 0.5 * log_var )
+        # This is equivalent to 1/(2*sigma^2) * loss + log(sigma)
+        total_loss = 0
+        for i, loss in enumerate(losses):
+            precision = torch.exp(-self.log_vars[i])
+            total_loss += precision * loss + 0.5 * self.log_vars[i]
+        return total_loss
+
+def compute_loss(outputs, targets, label_weights, config, spearman_loss_fn=None, question_only=False, return_dict=False):
     if question_only:
         outputs = outputs[:, :21]
         targets = targets[:, :21]
@@ -433,22 +541,41 @@ def compute_loss(outputs, targets, label_weights, alpha=0.5, margin=0.1, questio
     else:
         current_label_weights = label_weights
 
+    # 1. BCE Loss
     bce = F.binary_cross_entropy_with_logits(outputs, targets, reduction="none")
-    bce = (bce * current_label_weights).mean()
+    bce_val = (bce * current_label_weights).mean()
     
+    # 2. Ranking Loss
     batch_size = outputs.size(0)
     if batch_size % 2 == 0:
         outputs1, outputs2 = outputs.sigmoid().contiguous().view(2, batch_size // 2, outputs.size(-1))
         targets1, targets2 = targets.contiguous().view(2, batch_size // 2, outputs.size(-1))
-        # 1 if first ones are larger, -1 if second ones are larger, and 0 if equals.
         ordering = (targets1 > targets2).float() - (targets1 < targets2).float()
-        margin_rank_loss = (-ordering * (outputs1 - outputs2) + margin).clamp(min=0.0)
-        margin_rank_loss = (margin_rank_loss * current_label_weights).mean()
+        margin_rank_loss = (-ordering * (outputs1 - outputs2) + config.ranking_margin).clamp(min=0.0)
+        margin_rank_loss_val = (margin_rank_loss * current_label_weights).mean()
     else:
-        # batch size is not even number, so we can't devide them into pairs.
-        margin_rank_loss = torch.tensor(0.0, device=outputs.device)
+        margin_rank_loss_val = torch.tensor(0.0, device=outputs.device)
 
-    return alpha * bce + (1 - alpha) * margin_rank_loss
+    # 3. Spearman Loss
+    if spearman_loss_fn is not None:
+        spearman_loss_val = spearman_loss_fn(outputs, targets)
+    else:
+        spearman_loss_val = torch.tensor(0.0, device=outputs.device)
+
+    # Combined Loss
+    total_loss = (config.bce_weight * bce_val) + \
+                 (config.ranking_weight * margin_rank_loss_val) + \
+                 (config.spearman_weight * spearman_loss_val)
+
+    if return_dict:
+        return {
+            "total": total_loss,
+            "bce": bce_val,
+            "ranking": margin_rank_loss_val,
+            "spearman": spearman_loss_val
+        }
+
+    return total_loss
 
 def compute_spearmanr(trues, preds):
     rhos = []
@@ -547,6 +674,17 @@ def train_and_predict(train_data, valid_data, test_data, q_train_data, q_valid_d
             "weight_decay": config.weight_decay,
             "lr": config.lr_bert
         })
+        
+    # Automatic Weighting Parameters
+    auto_loss_fn = None
+    if config.use_auto_weighting:
+        print("Enabling Automatic Loss Weighting...")
+        auto_loss_fn = AutomaticWeightedLoss(num=3).to(device)
+        optimizer_grouped_parameters.append({
+            "params": auto_loss_fn.parameters(),
+            "weight_decay": 0.0,
+            "lr": 1e-3 # Usually needs higher LR than model
+        })
 
     optimizer = AdamW(optimizer_grouped_parameters)
     scheduler = get_linear_schedule_with_warmup(
@@ -557,14 +695,23 @@ def train_and_predict(train_data, valid_data, test_data, q_train_data, q_valid_d
     test_predictions = []
     valid_predictions = []
 
+    # Create best_model directory
+    best_model_dir = os.path.join(output_dir, "best_model")
+    os.makedirs(best_model_dir, exist_ok=True)
+
     scaler = torch.cuda.amp.GradScaler()
     
     # Initialize AWP
     # Start AWP from epoch 1 (second epoch) to let model stabilize first
-    awp = AWP(model, optimizer, adv_lr=1e-4, adv_eps=1e-2, start_epoch=1, scaler=scaler)
+    awp = AWP(model, optimizer, adv_lr=config.adv_lr, adv_eps=config.adv_eps, start_epoch=config.adv_start_epoch, scaler=scaler)
+
+    # Initialize SoftSpearmanLoss
+    spearman_loss_fn = SoftSpearmanLoss(temperature=config.spearman_temperature).to(device)
 
     ## Question Only
     print(f"Fold {fold}: Training Question Only")
+    best_q_spearman = -1
+    
     for epoch in range(config.q_epochs): 
         start = time.time()
         model.train()
@@ -582,14 +729,22 @@ def train_and_predict(train_data, valid_data, test_data, q_train_data, q_valid_d
             
             with torch.cuda.amp.autocast():
                 outputs = model(input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
-                loss = compute_loss(outputs, targets, label_weights, question_only=True)
+                if config.use_auto_weighting:
+                    loss_dict = compute_loss(outputs, targets, label_weights, config, spearman_loss_fn, question_only=True, return_dict=True)
+                    # For Q-Only, we might only care about BCE and Ranking? Or all 3?
+                    # Let's use all 3 but Spearman might be noisy on small batch?
+                    # Actually, Q-Only phase usually doesn't use Spearman in my previous code?
+                    # Wait, previous code passed `spearman_loss_fn` to `compute_loss` even in Q-Only.
+                    # So let's be consistent.
+                    loss = auto_loss_fn(loss_dict['bce'], loss_dict['ranking'], loss_dict['spearman'])
+                else:
+                    loss = compute_loss(outputs, targets, label_weights, config, spearman_loss_fn, question_only=True)
             
             scaler.scale(loss).backward()
             
             # AWP Attack
-            # We pass the raw inputs tuple to attack_backward
             inputs = (input_ids, token_type_ids, attention_mask)
-            awp.attack_backward(inputs, targets, label_weights, epoch)
+            awp.attack_backward(inputs, targets, label_weights, epoch, config, spearman_loss_fn, auto_loss_fn)
             
             scaler.step(optimizer)
             scaler.update()
@@ -615,7 +770,7 @@ def train_and_predict(train_data, valid_data, test_data, q_train_data, q_valid_d
                 prob[:, 21:] = 0.0 # Zero out answer predictions
                 valid_preds.extend(prob.cpu().numpy())
                 valid_targets.extend(targets.cpu().numpy())
-                loss = compute_loss(outputs, targets, label_weights, question_only=True)
+                loss = compute_loss(outputs, targets, label_weights, config, spearman_loss_fn, question_only=True)
                 valid_losses.append(loss.detach().cpu().item())
             
             valid_predictions.append(np.stack(valid_preds))
@@ -642,8 +797,13 @@ def train_and_predict(train_data, valid_data, test_data, q_train_data, q_valid_d
         ))
         print("\t elapsed: {}s".format(time.time() - start))
 
-        # Save model and logs
-        torch.save(model.state_dict(), os.path.join(output_dir, f"q_model_fold{fold}_epoch{epoch}.bin"))
+        # Save best model for Q phase (optional, usually we care about final QA model)
+        if valid_spearman_last > best_q_spearman:
+            best_q_spearman = valid_spearman_last
+            # torch.save(model.state_dict(), os.path.join(output_dir, f"q_model_fold{fold}_best.bin"))
+            # print(f"Saved best Q model with Spearman {best_q_spearman}")
+
+        # Log entry
         log_entry = {
             "fold": fold,
             "phase": "question_only",
@@ -655,6 +815,17 @@ def train_and_predict(train_data, valid_data, test_data, q_train_data, q_valid_d
             "valid_spearman_last": float(valid_spearman_last),
             "timestamp": datetime.now().isoformat()
         }
+        
+        # Add learned loss weights if using auto weighting
+        if config.use_auto_weighting and auto_loss_fn is not None:
+            learned_weights = torch.exp(-auto_loss_fn.log_vars).detach().cpu().numpy()
+            log_entry["learned_weights"] = {
+                "bce": float(learned_weights[0]),
+                "ranking": float(learned_weights[1]),
+                "spearman": float(learned_weights[2])
+            }
+            print(f"\t Learned Weights: BCE={learned_weights[0]:.4f}, Rank={learned_weights[1]:.4f}, Spear={learned_weights[2]:.4f}")
+            
         with open(os.path.join(output_dir, "training_log.jsonl"), "a") as f:
             f.write(json.dumps(log_entry) + "\n")
 
@@ -705,6 +876,21 @@ def train_and_predict(train_data, valid_data, test_data, q_train_data, q_valid_d
             "lr": config.lr_bert
         })
 
+    # Automatic Weighting Parameters (Reset for Q&A phase? Or reuse?)
+    # Usually we might want to continue training the weights or reset.
+    # Since we re-initialize the model, we should probably re-initialize the loss weights too, 
+    # or at least re-create the optimizer group.
+    # Let's re-initialize to be safe and consistent with model reset.
+    if config.use_auto_weighting:
+        print("Enabling Automatic Loss Weighting (Q&A Phase)...")
+        # If we want to keep learned weights, we should pass them. But here we reset model.
+        auto_loss_fn = AutomaticWeightedLoss(num=3).to(device) 
+        optimizer_grouped_parameters.append({
+            "params": auto_loss_fn.parameters(),
+            "weight_decay": 0.0,
+            "lr": 1e-3
+        })
+
     optimizer = AdamW(optimizer_grouped_parameters)
     scheduler = get_linear_schedule_with_warmup(
         optimizer, num_warmup_steps=int(len(dataloader) * (config.epochs) * 0.05),
@@ -714,7 +900,12 @@ def train_and_predict(train_data, valid_data, test_data, q_train_data, q_valid_d
     scaler = torch.cuda.amp.GradScaler()
     
     # Initialize AWP for Q&A phase
-    awp = AWP(model, optimizer, adv_lr=1e-4, adv_eps=1e-2, start_epoch=1, scaler=scaler)
+    awp = AWP(model, optimizer, adv_lr=config.adv_lr, adv_eps=config.adv_eps, start_epoch=config.adv_start_epoch, scaler=scaler)
+
+    # Initialize SoftSpearmanLoss
+    spearman_loss_fn = SoftSpearmanLoss(temperature=config.spearman_temperature).to(device)
+
+    best_qa_spearman = -1
 
     for epoch in range(config.epochs): 
         start = time.time()
@@ -732,13 +923,17 @@ def train_and_predict(train_data, valid_data, test_data, q_train_data, q_valid_d
             
             with torch.cuda.amp.autocast():
                 outputs = model(input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
-                loss = compute_loss(outputs, targets, label_weights)
+                if config.use_auto_weighting:
+                    loss_dict = compute_loss(outputs, targets, label_weights, config, spearman_loss_fn, return_dict=True)
+                    loss = auto_loss_fn(loss_dict['bce'], loss_dict['ranking'], loss_dict['spearman'])
+                else:
+                    loss = compute_loss(outputs, targets, label_weights, config, spearman_loss_fn)
             
             scaler.scale(loss).backward()
             
             # AWP Attack
             inputs = (input_ids, token_type_ids, attention_mask)
-            awp.attack_backward(inputs, targets, label_weights, epoch)
+            awp.attack_backward(inputs, targets, label_weights, epoch, config, spearman_loss_fn, auto_loss_fn)
             
             scaler.step(optimizer)
             scaler.update()
@@ -761,7 +956,7 @@ def train_and_predict(train_data, valid_data, test_data, q_train_data, q_valid_d
                 outputs = model(input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
                 valid_preds.extend(outputs.sigmoid().cpu().numpy())
                 valid_targets.extend(targets.cpu().numpy())
-                loss = compute_loss(outputs, targets, label_weights)
+                loss = compute_loss(outputs, targets, label_weights, config, spearman_loss_fn)
                 valid_losses.append(loss.detach().cpu().item())
             
             valid_predictions.append(np.stack(valid_preds))
@@ -785,8 +980,12 @@ def train_and_predict(train_data, valid_data, test_data, q_train_data, q_valid_d
         ))
         print("\t elapsed: {}s".format(time.time() - start))
 
-        # Save model and logs
-        torch.save(model.state_dict(), os.path.join(output_dir, f"qa_model_fold{fold}_epoch{epoch}.bin"))
+        # Save Best Model
+        if valid_spearman_last > best_qa_spearman:
+            best_qa_spearman = valid_spearman_last
+            torch.save(model.state_dict(), os.path.join(best_model_dir, f"qa_model_fold{fold}_best.bin"))
+            print(f"Saved best QA model with Spearman {best_qa_spearman}")
+
         log_entry = {
             "fold": fold,
             "phase": "qa",
@@ -798,6 +997,17 @@ def train_and_predict(train_data, valid_data, test_data, q_train_data, q_valid_d
             "valid_spearman_last": float(valid_spearman_last),
             "timestamp": datetime.now().isoformat()
         }
+        
+        # Add learned loss weights if using auto weighting
+        if config.use_auto_weighting and auto_loss_fn is not None:
+            learned_weights = torch.exp(-auto_loss_fn.log_vars).detach().cpu().numpy()
+            log_entry["learned_weights"] = {
+                "bce": float(learned_weights[0]),
+                "ranking": float(learned_weights[1]),
+                "spearman": float(learned_weights[2])
+            }
+            print(f"\t Learned Weights: BCE={learned_weights[0]:.4f}, Rank={learned_weights[1]:.4f}, Spear={learned_weights[2]:.4f}")
+            
         with open(os.path.join(output_dir, "training_log.jsonl"), "a") as f:
             f.write(json.dumps(log_entry) + "\n")
 
@@ -852,6 +1062,15 @@ def main():
     print(f"  - BERT:          {Config.lr_bert}")
     print(f"  - Head:          {Config.lr_head}")
     print(f"Weight Decay:      {Config.weight_decay}")
+    print(f"AWP:")
+    print(f"  - LR:            {Config.adv_lr}")
+    print(f"  - EPS:           {Config.adv_eps}")
+    print(f"  - Start Epoch:   {Config.adv_start_epoch}")
+    print(f"Loss Weights:")
+    print(f"  - BCE:           {Config.bce_weight}")
+    print(f"  - Ranking:       {Config.ranking_weight}")
+    print(f"  - Spearman:      {Config.spearman_weight}")
+    print(f"Auto Weighting:    {Config.use_auto_weighting}")
     print(f"Seed:              {Config.seed}")
     print(f"Local Eval:        {Config.local_eval}")
     print(f"Output Directory:  {Config.output_dir}")
@@ -876,6 +1095,12 @@ def main():
     
     # Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(Config.model_name)
+    
+    # Save tokenizer to best_model directory for offline usage
+    best_model_dir = os.path.join(Config.output_dir, "best_model")
+    os.makedirs(best_model_dir, exist_ok=True)
+    tokenizer.save_pretrained(best_model_dir)
+    print(f"Tokenizer saved to {best_model_dir}")
 
     # Compute Inputs
     print("Computing input arrays...")
