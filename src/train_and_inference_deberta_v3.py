@@ -27,7 +27,7 @@ warnings.filterwarnings("ignore")
 
 class Config:
     seed = 42
-    model_name = "microsoft/deberta-v3-base"
+    model_name = "microsoft/deberta-v3-large"
     max_sequence_length = 1024
     epochs = 5
     q_epochs = 5
@@ -40,13 +40,13 @@ class Config:
     weight_decay = 1e-2
     
     # AWP (Disabled for final run)
-    adv_lr = 0
+    adv_lr = 0.0
     adv_eps = 1e-3
-    adv_start_epoch = 1
+    adv_start_epoch = 2
     
     # Loss Weights
-    bce_weight = 0.5
-    ranking_weight = 1.0
+    bce_weight = 0.0
+    ranking_weight = 0.5
     spearman_weight = 0.5
     
     # Ranking Loss Params
@@ -56,7 +56,7 @@ class Config:
     spearman_temperature = 1.0
     
     # Automatic Weighting
-    use_auto_weighting = True
+    use_auto_weighting = False
     
     # Paths
     data_dir = "data"
@@ -66,7 +66,7 @@ class Config:
     sub_csv = "sample_submission.csv"
     
     # Local Eval
-    local_eval = False
+    local_eval = True
     test_size = 0.1
 
 def seed_everything(seed=Config.seed):
@@ -403,7 +403,7 @@ class AWP:
         self.backup_eps = {}
         self.scaler = scaler
 
-    def attack_backward(self, inputs, labels, label_weights, epoch, config, spearman_loss_fn=None, auto_loss_fn=None):
+    def attack_backward(self, inputs, labels, label_weights, epoch, config, spearman_loss_fn=None, auto_loss_fn=None, question_only=False):
         if (self.adv_lr == 0) or (epoch < self.start_epoch):
             return None
 
@@ -417,18 +417,24 @@ class AWP:
                 outputs = self.model(input_ids, attention_mask, token_type_ids)
                 
                 if auto_loss_fn is not None:
-                    loss_dict = compute_loss(outputs, labels, label_weights, config, spearman_loss_fn, return_dict=True)
+                    loss_dict = compute_loss(outputs, labels, label_weights, config, spearman_loss_fn, 
+                                           question_only=question_only, return_dict=True)
                     adv_loss = auto_loss_fn(loss_dict['bce'], loss_dict['ranking'], loss_dict['spearman'])
                 else:
-                    adv_loss = compute_loss(outputs, labels, label_weights, config, spearman_loss_fn)
+                    adv_loss = compute_loss(outputs, labels, label_weights, config, spearman_loss_fn,
+                                          question_only=question_only)
             
-            self.optimizer.zero_grad()
+            # DON'T zero grad here! We want to accumulate gradients
+            # self.optimizer.zero_grad()
+            
             if self.scaler:
                 self.scaler.scale(adv_loss).backward()
             else:
                 adv_loss.backward()
             
         self._restore()
+        
+        return adv_loss.detach()
 
     def _attack_step(self):
         e = 1e-6
@@ -742,9 +748,9 @@ def train_and_predict(train_data, valid_data, test_data, q_train_data, q_valid_d
             
             scaler.scale(loss).backward()
             
-            # AWP Attack
-            inputs = (input_ids, token_type_ids, attention_mask)
-            awp.attack_backward(inputs, targets, label_weights, epoch, config, spearman_loss_fn, auto_loss_fn)
+            # AWP Attack - SKIP for Q-Only phase
+            # inputs = (input_ids, token_type_ids, attention_mask)
+            # awp.attack_backward(inputs, targets, label_weights, epoch, config, spearman_loss_fn, auto_loss_fn, question_only=True)
             
             scaler.step(optimizer)
             scaler.update()
@@ -933,7 +939,7 @@ def train_and_predict(train_data, valid_data, test_data, q_train_data, q_valid_d
             
             # AWP Attack
             inputs = (input_ids, token_type_ids, attention_mask)
-            awp.attack_backward(inputs, targets, label_weights, epoch, config, spearman_loss_fn, auto_loss_fn)
+            awp.attack_backward(inputs, targets, label_weights, epoch, config, spearman_loss_fn, auto_loss_fn, question_only=False)
             
             scaler.step(optimizer)
             scaler.update()
@@ -1277,6 +1283,7 @@ def main():
         sub['qa_id'] = df_test['qa_id']
         sub.iloc[:, 1:] = np.array(final_test_preds).T
     else:
+        sub = pd.read_csv(os.path.join(Config.data_dir, Config.sub_csv))
         sub.iloc[:, 1:] = np.array(final_test_preds).T
     
     if Config.local_eval:
