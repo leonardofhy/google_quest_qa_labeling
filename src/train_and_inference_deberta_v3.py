@@ -1236,6 +1236,17 @@ def main():
     for j, name in enumerate(output_categories):
         for epoch in range(n_epochs_total):
             oof_predictions[epoch, :, j] = val_preds_list[epoch][:, j]
+            
+    # Save OOF Predictions and Fold IDs for Notebook
+    print("Saving OOF predictions and Fold IDs...")
+    np.save(os.path.join(best_model_dir, "oof_preds.npy"), oof_predictions)
+    
+    # Save fold_ids (convert to list for JSON serialization)
+    # fold_ids is list of (train_idx, valid_idx)
+    fold_ids_list = [[t.tolist(), v.tolist()] for t, v in fold_ids]
+    with open(os.path.join(best_model_dir, "fold_ids.json"), "w") as f:
+        json.dump(fold_ids_list, f)
+    print(f"OOFs and Fold IDs saved to {best_model_dir}")
 
     # 2. Get test preds per each epoch
     test_preds_list = []
@@ -1352,7 +1363,24 @@ def main():
         print("Submission saved to submission.csv")
         
         # Save final summary
+        # Save final summary
+        # Calculate CV Score (Spearman)
+        # We use the final_test_preds if local_eval, but for CV score we need OOF preds vs Targets
+        # Let's use the LAST epoch OOFs for simplicity, or the stacked ones if we did stacking.
+        # Since we didn't do stacking for OOFs in the script (only for test), let's use the last epoch OOFs.
+        
+        # OOF Shape: (n_epochs, n_samples, n_targets)
+        # Targets: df_train[output_categories]
+        
+        if len(histories) == Config.n_splits:
+            oof_last_epoch = oof_predictions[-1] # (n_samples, n_targets)
+            cv_score = compute_spearmanr(df_train[output_categories].values, oof_last_epoch)
+            print(f"CV Score (Last Epoch OOF): {cv_score:.5f}")
+        else:
+            cv_score = 0.0
+            
         summary = {
+            "cv_score": float(cv_score),
             "n_folds": Config.n_splits,
             "total_epochs_per_fold": Config.epochs_phase1 + Config.epochs_phase2,
             "training_complete": True,
