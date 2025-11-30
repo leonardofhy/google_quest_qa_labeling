@@ -12,3 +12,5 @@ quest-finetuned-weights/
 models/
 
 deberta-v3-large/
+
+output/
