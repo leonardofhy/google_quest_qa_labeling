@@ -30,9 +30,9 @@ class Config:
     seed = 42
     model_name = "microsoft/deberta-v3-base"
     max_sequence_length = 1024
-    epochs_phase2 = 3
-    epochs_phase1 = 3
-    batch_size = 4
+    epochs_phase2 = 5
+    epochs_phase1 = 5
+    batch_size = 8
     gradient_accumulation_steps = 2
     n_splits = 5
     
@@ -43,7 +43,7 @@ class Config:
     max_grad_norm = 1.0
     
     # AWP (Disabled for final run)
-    awp_lr = 0.0
+    awp_lr = 1e-4
     awp_eps = 1e-3
     awp_start_epoch = 2
     
