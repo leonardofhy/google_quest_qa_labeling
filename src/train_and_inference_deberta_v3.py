@@ -25,14 +25,15 @@ from tqdm import tqdm
 # Suppress warnings
 warnings.filterwarnings("ignore")
 
+
 class Config:
     seed = 42
-    model_name = "microsoft/deberta-v3-large"
+    model_name = "microsoft/deberta-v3-base"
     max_sequence_length = 1024
     epochs_phase2 = 3
     epochs_phase1 = 3
-    batch_size = 8
-    gradient_accumulation_steps = 1
+    batch_size = 4
+    gradient_accumulation_steps = 2
     n_splits = 5
     
     # Optimizer
@@ -47,8 +48,8 @@ class Config:
     awp_start_epoch = 2
     
     # Loss Weights
-    bce_weight = 0.0
-    ranking_weight = 0.5
+    bce_weight = 0.5
+    ranking_weight = 1.0
     spearman_weight = 0.5
     
     # Ranking Loss Params
@@ -345,7 +346,7 @@ class AWP:
         self.backup_eps = {}
         self.scaler = scaler
 
-    def attack_backward(self, inputs, labels, label_weights, epoch):
+    def attack_backward(self, inputs, labels, label_weights, epoch, config, spearman_loss_fn=None, auto_loss_fn=None):
         if (self.adv_lr == 0) or (epoch < self.start_epoch):
             return None
 
@@ -354,23 +355,15 @@ class AWP:
             self._attack_step() 
             with torch.cuda.amp.autocast():
                 # Re-run forward pass with perturbed weights
-                # Note: We need to unpack inputs here just like in the main loop
                 input_ids, token_type_ids, attention_mask = inputs
                 outputs = self.model(input_ids, attention_mask, token_type_ids)
-                # Note: AWP attack step usually uses the same loss function, but for simplicity/speed 
-                # we often just use BCE or the main loss. 
-                # Here we need to pass config and spearman_loss_fn if we want full consistency.
-                # However, `awp.attack_backward` signature doesn't have them.
-                # Let's assume we pass them or modify AWP. 
-                # For now, let's keep it simple and use a simplified loss or pass None for spearman to save compute?
-                # Actually, AWP class is defined in this file, so I can modify it.
-                # But to minimize changes, I'll just use BCE + Ranking (if I can access config)
-                # Or better, I should update AWP signature.
-                pass # Placeholder for the diff block, see below for actual replacement
                 
-                # Wait, I need to update AWP.attack_backward signature too.
-                # Let's do that in a separate chunk or include it here.
-                pass
+                # Compute Loss using the same logic as main loop
+                if config.use_auto_weighting and auto_loss_fn is not None:
+                    loss_dict = compute_loss(outputs, labels, label_weights, config, spearman_loss_fn, return_dict=True)
+                    adv_loss = auto_loss_fn(loss_dict['bce'], loss_dict['ranking'], loss_dict['spearman'])
+                else:
+                    adv_loss = compute_loss(outputs, labels, label_weights, config, spearman_loss_fn)
             
             self.optimizer.zero_grad()
             if self.scaler:
@@ -947,6 +940,7 @@ def train_and_predict(train_data, valid_data, test_data, q_train_data, q_valid_d
     spearman_loss_fn = SoftSpearmanLoss(temperature=config.spearman_temperature).to(device)
 
     best_qa_spearman = -1
+    best_epoch = -1
 
     for epoch in range(config.epochs_phase2): 
         start = time.time()
@@ -976,8 +970,8 @@ def train_and_predict(train_data, valid_data, test_data, q_train_data, q_valid_d
             scaler.scale(loss).backward()
             
             # AWP Attack
-            # inputs = (input_ids, token_type_ids, attention_mask)
-            # awp.attack_backward(inputs, targets, label_weights, epoch, config, spearman_loss_fn, auto_loss_fn)
+            inputs = (input_ids, token_type_ids, attention_mask)
+            awp.attack_backward(inputs, targets, label_weights, epoch, config, spearman_loss_fn, auto_loss_fn if config.use_auto_weighting else None)
             
             if (step + 1) % accumulation_steps == 0:
                 scaler.unscale_(optimizer)
@@ -1031,8 +1025,9 @@ def train_and_predict(train_data, valid_data, test_data, q_train_data, q_valid_d
         # Save Best Model
         if valid_spearman_last > best_qa_spearman:
             best_qa_spearman = valid_spearman_last
+            best_epoch = config.epochs_phase1 + epoch
             torch.save(model.state_dict(), os.path.join(best_model_dir, f"qa_model_fold{fold}_best.bin"))
-            print(f"Saved best QA model with Spearman {best_qa_spearman}")
+            print(f"Saved best QA model with Spearman {best_qa_spearman} at epoch {best_epoch+1}")
 
         log_entry = {
             "fold": fold,
@@ -1059,7 +1054,7 @@ def train_and_predict(train_data, valid_data, test_data, q_train_data, q_valid_d
         with open(os.path.join(output_dir, "training_log.jsonl"), "a") as f:
             f.write(json.dumps(log_entry) + "\n")
 
-    return valid_predictions, test_predictions
+    return valid_predictions, test_predictions, best_epoch
 
 def main():
     parser = argparse.ArgumentParser()
@@ -1192,7 +1187,7 @@ def main():
         valid_dataset = TensorDataset(*valid_inputs_fold, valid_outputs_fold)
         q_valid_dataset = TensorDataset(*q_valid_inputs_fold, valid_outputs_fold)
 
-        history = train_and_predict(
+        history, test_history, best_epoch = train_and_predict(
             train_data=train_dataset, 
             valid_data=valid_dataset,
             test_data=test_dataset, 
@@ -1202,7 +1197,7 @@ def main():
             fold=fold,
             device=device, label_weights=LABEL_WEIGHTS, output_dir=Config.output_dir, config=Config
         )
-        histories.append(history)
+        histories.append((history, test_history, best_epoch))
 
     # Post-processing (Averaging)
     # The notebook does LightGBM stacking, but for the script, let's first implement simple averaging as a baseline
@@ -1241,12 +1236,32 @@ def main():
     print("Saving OOF predictions and Fold IDs...")
     np.save(os.path.join(best_model_dir, "oof_preds.npy"), oof_predictions)
     
+    # Save Best Epoch OOFs
+    oof_predictions_best = np.zeros((len(df_train), len(output_categories)), dtype=np.float32)
+    for fold in range(len(histories)):
+        _, valid_idx = fold_ids[fold]
+        best_epoch = histories[fold][2]
+        if best_epoch == -1:
+             print(f"[WARNING] Best epoch not found for fold {fold}, using last epoch.")
+             best_epoch = n_epochs_total - 1
+             
+        val_pred_best = histories[fold][0][best_epoch]
+        oof_predictions_best[valid_idx, :] = val_pred_best
+        
+    np.save(os.path.join(best_model_dir, "oof_preds_best.npy"), oof_predictions_best)
+    print(f"Saved oof_preds_best.npy (Best Epoch OOFs)")
+    
     # Save fold_ids (convert to list for JSON serialization)
     # fold_ids is list of (train_idx, valid_idx)
     fold_ids_list = [[t.tolist(), v.tolist()] for t, v in fold_ids]
     with open(os.path.join(best_model_dir, "fold_ids.json"), "w") as f:
         json.dump(fold_ids_list, f)
-    print(f"OOFs and Fold IDs saved to {best_model_dir}")
+        
+    # Save target columns for reproducibility
+    with open(os.path.join(best_model_dir, "target_cols.json"), "w") as f:
+        json.dump(output_categories, f)
+        
+    print(f"OOFs, Fold IDs, and Target Cols saved to {best_model_dir}")
 
     # 2. Get test preds per each epoch
     test_preds_list = []
@@ -1262,6 +1277,11 @@ def main():
     for j, name in enumerate(output_categories):
         for epoch in range(n_epochs_total):
             test_predictions[epoch, :, j] = test_preds_list[epoch][:, j]
+
+    # Save Test Predictions for LightGBM Stacking (Essential for Notebook Reproducibility)
+    print("Saving test predictions...")
+    np.save(os.path.join(best_model_dir, "test_preds.npy"), test_predictions)
+    print(f"Saved test_preds.npy with shape {test_predictions.shape}")
 
     # LightGBM Stacking
     if len(histories) == Config.n_splits:
