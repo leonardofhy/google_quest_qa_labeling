@@ -106,7 +106,9 @@ def analyze_model(model_dir):
         "cv_best_avg": cv_best_avg,
         "cv_best_last": cv_best_last,
         "cv_final_avg": cv_final_avg,
-        "n_folds": n_folds
+        "n_folds": n_folds,
+        "folds_best_avg": [fold_metrics[f]["best_avg"] for f in sorted(fold_metrics.keys())],
+        "folds_best_last": [fold_metrics[f]["best_last"] for f in sorted(fold_metrics.keys())]
     }
 
 def main():
@@ -130,14 +132,31 @@ def main():
         print("No valid models found.")
         return
 
-    # Reorder columns
-    cols = ["timestamp", "cv_best_avg", "cv_best_last", "cv_final_avg", "n_folds", "model", "epochs", "awp", "auto_w", "loss"]
-    df = df[cols]
+    # Format per-fold columns
+    df["folds_avg_str"] = df["folds_best_avg"].apply(lambda x: " | ".join([f"{v:.4f}" for v in x]))
+    df["folds_last_str"] = df["folds_best_last"].apply(lambda x: " | ".join([f"{v:.4f}" for v in x]))
+
+    # Table 1: Summary
+    cols_summary = ["timestamp", "cv_best_avg", "cv_best_last", "cv_final_avg", "n_folds", "model", "epochs", "awp", "auto_w", "loss"]
+    df_summary = df[cols_summary]
+
+    # Table 2: Details
+    cols_details = ["timestamp", "folds_avg_str", "folds_last_str"]
+    df_details = df[cols_details]
+    
+    pd.set_option('display.max_colwidth', None)
+    pd.set_option('display.width', 1000)
     
     print("\n" + "="*140)
-    print(f"{'MODEL PERFORMANCE RANKING (Sorted by Best Ensemble CV)':^140}")
+    print(f"{'MODEL PERFORMANCE RANKING (Summary)':^140}")
     print("="*140)
-    print(df.to_string(index=False, float_format=lambda x: "{:.5f}".format(x)))
+    print(df_summary.to_string(index=False, float_format=lambda x: "{:.5f}".format(x)))
+    print("="*140)
+
+    print("\n" + "="*140)
+    print(f"{'PER-FOLD DETAILS (Best Avg | Best Last)':^140}")
+    print("="*140)
+    print(df_details.to_string(index=False))
     print("="*140)
     
     # Highlight the winner
